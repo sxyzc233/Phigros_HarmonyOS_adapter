@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "模块描述"
+    },
+    {
+      "name": "default_reason",
+      "value": "权限申请"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Phigros Adapter"
+    },
+    {
+      "name": "permission_microphone_reason_desc",
+      "value": "request microphone permission"
+    }
+  ]
+}

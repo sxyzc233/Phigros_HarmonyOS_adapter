@@ -1,0 +1,12 @@
+{
+  "app": {
+    "bundleName": "com.rea.message.demo",
+    "vendor": "REA Coursework",
+    "versionCode": 10000006,
+    "versionName": "1.0.6",
+    "icon": "$media:app_icon",
+    "label": "$string:app_name",
+    "distributedNotificationEnabled": true,
+    "asanEnabled": false
+  }
+}

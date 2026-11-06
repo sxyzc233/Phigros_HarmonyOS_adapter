@@ -1,0 +1,7 @@
+{
+  "name": "entry",
+  "version": "1.0.6",
+  "license": "MIT",
+  "description": "Android Unity player compatibility host for HarmonyOS",
+  "dependencies": {}
+}
