@@ -39,6 +39,20 @@ void ReaSetAppForeground(bool foreground) {
     }
     changed.notify_all();
 }
+/*
+ * Window focus inside the foreground, delivered to the engine as UnityPlayer's own
+ * nativeFocusChanged. Raising an ArkUI sheet does not make the ability background, so without this
+ * the engine would keep believing it still has the focus the player taps into.
+ */
+void ReaSetAppFocus(bool focused) {
+    {
+        std::lock_guard<std::mutex> lock(stateMutex);
+        if(state.focused==focused)return;
+        state.focused=focused;++state.serial;
+        OH_LOG_Print(LOG_APP,LOG_INFO,0,"TransLifecycle","WINDOW focus=%{public}d",focused?1:0);
+    }
+    changed.notify_all();
+}
 extern "C" bool ReaNativeSurfaceAvailable() {return bool(ReaReadLifecycle().surface);}
 extern "C" void *ReaShim_GetNativeWindow() {
     auto snapshot=ReaReadLifecycle();return snapshot.surface?snapshot.surface->window:nullptr;

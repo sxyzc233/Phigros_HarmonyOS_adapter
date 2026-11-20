@@ -231,6 +231,39 @@ bool FrameworkArguments(MethodRef *method, void *raw, bool array,
     return true;
 }
 
+/*
+ * Links the engine hands to the platform (Application.OpenURL -> Intent.ACTION_VIEW -> startActivity).
+ * The engine has no way to receive a result, so a single slot is enough: newest wins, the page drains
+ * it on its next tick and opens the system handler.
+ */
+static std::mutex g_externalOpenMutex;
+static std::string g_externalOpenUrl;
+
+extern "C" void ReaQueueExternalOpen(const char *url)
+{
+    if (!url || !*url) return;
+    {
+        std::lock_guard<std::mutex> lock(g_externalOpenMutex);
+        g_externalOpenUrl = url;
+    }
+    Emit("EXTERNAL_OPEN requested url=%s", url);
+}
+
+extern "C" int ReaTakeExternalOpen(char *out, int capacity)
+{
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lock(g_externalOpenMutex);
+        if (g_externalOpenUrl.empty()) return 0;
+        url.swap(g_externalOpenUrl);
+    }
+    if (!out || capacity <= 0) return 0;
+    const int length = (int)url.size() < capacity - 1 ? (int)url.size() : capacity - 1;
+    memcpy(out, url.c_str(), (size_t)length);
+    out[length] = '\0';
+    return length;
+}
+
 FakeObject *NewObject(const std::string &cls)
 {
     FakeObject *obj = new FakeObject();
@@ -286,6 +319,21 @@ std::vector<FakeObject *> g_systemRoots;
 thread_local FakeObject *g_pendingException=nullptr;
 const char *g_packageName = "com.PigeonGames.Phigros";
 bool g_traceJni = false;
+/*
+ * Runtime switch behind 调试 -> 详细日志. g_traceJni above is capped at 120 calls and only lives for
+ * the duration of an initJni trace; this one is uncapped and stays on until switched off. It records
+ * every framework call plus both edges of nativeRender, which is what pins down a hang: the last
+ * call the frame thread made before it stopped returning.
+ */
+std::atomic<bool> g_jniTraceAll{false};
+extern "C" void ReaSetJniTrace(bool on)
+{
+    g_jniTraceAll.store(on, std::memory_order_relaxed);
+    // Announced on every change: without this line an empty trace is indistinguishable from a
+    // switch that never reached the native layer.
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0, "TransJni", "JNI_TRACE set enabled=%{public}d", on ? 1 : 0);
+}
+extern "C" bool ReaJniTraceState() { return g_jniTraceAll.load(std::memory_order_relaxed); }
 bool g_manualIl2cppInit = false;
 unsigned long g_unityBase = 0;
 bool g_callChainRoot = false;
@@ -420,6 +468,11 @@ static FakeObject *MakeStringObject(const char *value)
 
 void *DispatchObjectCall(FakeObject *obj, MethodRef *m, void *arg0, void *arg1,void *arg2,void *arg3)
 {
+    // Every framework call passes through here, including the ones answered further down, so this
+    // is the one place that can show what the engine was doing right before it stopped.
+    if (m && g_jniTraceAll.load(std::memory_order_relaxed))
+        Emit("JNI_TRACE %s.%s %s", obj ? obj->cls.c_str() : m->cls.c_str(), m->name.c_str(),
+             m->signature.c_str());
     /*
      * Start-up calls the engine makes once initialisation gets going. They are answered here without
      * depending on the exact class, because the engine reaches them through several wrappers.
@@ -574,6 +627,17 @@ void *DispatchObjectCall(FakeObject *obj, MethodRef *m, void *arg0, void *arg1,v
             if(name=="isNotAdult")return (void *)(intptr_t)(!g_sdkAllowed||g_sdkAge<18);
         }
         if (name == "<init>") {
+            if (obj && m->cls == "android/content/Intent") {
+                // Intent(String action) and Intent(String action, Uri data) both carry the payload
+                // that startActivity has to open; keep it on the object.
+                if (IsFakeObject(arg0)) obj->strs["action"] = static_cast<FakeObject *>(arg0)->strs["value"];
+                else obj->strs["action"] = ArgToString(arg0);
+                if (IsFakeObject(arg1)) {
+                    auto *data = static_cast<FakeObject *>(arg1);
+                    if (!data->strs["value"].empty()) obj->strs["data"] = data->strs["value"];
+                }
+            }
+            if (obj && m->cls == "android/net/Uri") obj->strs["value"] = ArgToString(arg0);
             if (obj && m->signature == "(J)V") obj->ints["cookie"] = (int64_t)(intptr_t)arg0;
             if (obj && m->cls == "java/lang/Thread") obj->refs["runnable"] = arg0;
             if (obj && m->cls == "android/os/HandlerThread") {
@@ -598,6 +662,79 @@ void *DispatchObjectCall(FakeObject *obj, MethodRef *m, void *arg0, void *arg1,v
                 uint64_t count=g_stringConstructions.fetch_add(1,std::memory_order_relaxed)+1;
                 if(g_traceJni||count<=4)Emit("JNI_CONSTRUCT %s %s",m->cls.c_str(),m->signature.c_str());
             }else Emit("JNI_CONSTRUCT %s %s", m->cls.c_str(), m->signature.c_str());
+            return nullptr;
+        }
+
+        /*
+         * Uri and Intent: the surface Application.OpenURL and share/link buttons need. The engine only
+         * ever hands a URL over and expects the platform to open it, so the payload is what matters.
+         */
+        if (m->cls == "android/net/Uri") {
+            if (name == "parse" || name == "fromFile" || name == "fromParts" || name == "withAppendedPath") {
+                FakeObject *uri = NewObject("android/net/Uri");
+                uri->strs["value"] = ArgToString(arg0);
+                return uri;
+            }
+            if (obj) {
+                if (name == "toString" || name == "getPath" || name == "getEncodedPath")
+                    return MakeStringObject(obj->strs["value"].c_str());
+                if (name == "getScheme") {
+                    const std::string &value = obj->strs["value"];
+                    auto colon = value.find(':');
+                    return MakeStringObject(colon == std::string::npos ? "" : value.substr(0, colon).c_str());
+                }
+            }
+        }
+        if (m->cls == "android/content/Intent") {
+            if (name == "setData" || name == "setDataAndType" || name == "setDataAndNormalize") {
+                if (obj && IsFakeObject(arg0)) {
+                    const std::string &value = static_cast<FakeObject *>(arg0)->strs["value"];
+                    if (!value.empty()) obj->strs["data"] = value;
+                }
+                return obj;
+            }
+            if (name == "setAction") {
+                if (obj) obj->strs["action"] = IsFakeObject(arg0)
+                                                   ? static_cast<FakeObject *>(arg0)->strs["value"]
+                                                   : ArgToString(arg0);
+                return obj;
+            }
+            if (name == "putExtra") {
+                // Only the text extra matters here: it is what a share sheet or a view intent carries.
+                if (obj && IsFakeObject(arg0) && IsFakeObject(arg1)) {
+                    const std::string &key = static_cast<FakeObject *>(arg0)->strs["value"];
+                    const std::string &value = static_cast<FakeObject *>(arg1)->strs["value"];
+                    if (key.find("TEXT") != std::string::npos && !value.empty()) obj->strs["extraText"] = value;
+                }
+                return obj;
+            }
+            if (name == "getData" || name == "getDataString") {
+                if (!obj) return nullptr;
+                if (name == "getData") {
+                    FakeObject *uri = NewObject("android/net/Uri");
+                    uri->strs["value"] = obj->strs["data"];
+                    return uri;
+                }
+                return MakeStringObject(obj->strs["data"].c_str());
+            }
+            if (name == "getAction") return MakeStringObject(obj ? obj->strs["action"].c_str() : "");
+            if (name == "addFlags" || name == "setFlags" || name == "setPackage" || name == "setClassName" ||
+                name == "setComponent" || name == "setType" || name == "setFlags")
+                return obj;
+        }
+        /*
+         * The launch itself. Nothing comes back to the engine, so the URL is queued for the page,
+         * which opens it with the system handler; dropping it silently is what made external links
+         * dead before.
+         */
+        if (obj && (name == "startActivity" || name == "startActivityForResult" || name == "startActivityIfNeeded")) {
+            FakeObject *intent = IsFakeObject(arg0) ? static_cast<FakeObject *>(arg0) : nullptr;
+            if (intent) {
+                std::string target = intent->strs["data"];
+                if (target.empty()) target = intent->strs["extraText"];
+                if (!target.empty()) ReaQueueExternalOpen(target.c_str());
+                else Emit("EXTERNAL_OPEN skipped: intent carries no data");
+            }
             return nullptr;
         }
 
@@ -2892,6 +3029,12 @@ static pthread_t g_frameThread;
 static std::atomic<bool> g_frameThreadValid{false};
 static std::atomic<bool> g_frameInProgress{false};
 static std::atomic<uint64_t> g_frameSerial{0};
+/*
+ * When the frame currently inside nativeRender started, or -1 when no frame is in flight. The page
+ * polls this and treats a frame that has been running for seconds as a dead engine rather than as a
+ * slow one - normal frames here are 7-25 ms, so the margin is measured in hundreds.
+ */
+static std::atomic<int64_t> g_frameStartNs{-1};
 static volatile unsigned long g_hangPc = 0;
 static volatile unsigned long g_hangLr = 0;
 static volatile unsigned long g_hangSp = 0;
@@ -3569,6 +3712,22 @@ static void RecordTouchFrame(const TouchMetrics &before,int64_t frameDone)
         before.count?before.injectSum/1e6/before.count:0,before.injectMax/1e6,p50,p95,before.active,(unsigned long long)before.rejected);
     lastPrinted=before.count;lastPrintNs=frameDone;
 }
+/*
+ * Records a pointer's position without injecting anything.
+ *
+ * The coalescing below may skip an injection, but it must never skip the state: every injected event
+ * is built from g_activeTouches, so a skipped update left that finger at an older position in all
+ * following snapshots. Combined with a gate that only one finger can win per window, that is what made
+ * some pointers lag far behind their neighbours.
+ */
+static void RecordTouchState(const TouchInput &input)
+{
+    std::lock_guard<std::mutex> lock(g_touchStateMutex);
+    if(!g_inputReady.load(std::memory_order_acquire))return;
+    if(input.action!=0 && input.action!=3 && g_activeTouches.count(input.id)==0)return;
+    g_activeTouches[input.id]={input.id,input.x,input.y};
+}
+
 static void SubmitTouch(const TouchInput &input,bool cancelForPause=false)
 {
     std::lock_guard<std::mutex> lock(g_touchStateMutex);
@@ -3629,6 +3788,10 @@ struct UnityHostStart {
     void *inject;
     void *pause;
 };
+/* Frame pacing reported to the UI. Updated once a second from the render loop. */
+static std::atomic<uint32_t> g_frameRate{0};
+static std::atomic<uint64_t> g_frameCount{0};
+
 static void *UnityHostBody(void *raw)
 {
     std::unique_ptr<UnityHostStart> start(static_cast<UnityHostStart *>(raw));
@@ -3636,8 +3799,9 @@ static void *UnityHostBody(void *raw)
     Emit("UNITY_HOST started tid=%d initJni kept on UI thread",(int)syscall(SYS_gettid));
     g_frameThread=pthread_self();g_frameThreadValid=true;
     StartFaultWatchdog();StartHangWatchdog();
-    bool running=false,everResumed=false;
+    bool running=false,everResumed=false,seenFocus=true;
     uint64_t frame=0,seenPauseEpoch=0,boundEpoch=0;
+    uint64_t fpsWindowStart=MonotonicNs();uint32_t fpsWindowFrames=0;
     std::shared_ptr<ReaNativeSurface> bound;
     auto focus=[&](bool value){if(start->focus)((void (*)(void *,void *,unsigned char))start->focus)(&g_env,start->player,value?1:0);};
     auto resume=[&]{if(start->resume)((void (*)(void *,void *))start->resume)(&g_env,start->player);};
@@ -3647,6 +3811,7 @@ static void *UnityHostBody(void *raw)
         auto state=ReaReadLifecycle();
         if(running&&(!state.foreground||!state.surface||state.pauseEpoch!=seenPauseEpoch||state.surfaceEpoch!=boundEpoch)) {
             g_inputReady.store(false,std::memory_order_release);
+            g_frameRate.store(0,std::memory_order_relaxed);
             SubmitTouch({3,0,0,0,0,MonotonicNs()},true);
             focus(false);
             Emit("LIFECYCLE pause begin frame=%llu epoch=%llu tid=%d",(unsigned long long)frame,(unsigned long long)state.pauseEpoch,(int)syscall(SYS_gettid));
@@ -3655,6 +3820,13 @@ static void *UnityHostBody(void *raw)
             Emit("LIFECYCLE pause done quit=%u ms=%.3f",(unsigned)quit,(MonotonicNs()-before)/1e6);
             running=false;
             if(quit){ReaRequestPlayerExit("nativePause(true)");break;}
+        }
+        // Foreground window focus, independent of pause: an ArkUI sheet or any other overlay that
+        // takes the window focus reaches the engine exactly as Android's onWindowFocusChanged does.
+        if(running&&state.focused!=seenFocus) {
+            seenFocus=state.focused;
+            focus(seenFocus);
+            Emit("LIFECYCLE focus=%d frame=%llu",seenFocus?1:0,(unsigned long long)frame);
         }
         seenPauseEpoch=state.pauseEpoch;
         if(bound&&(!state.surface||state.surfaceEpoch!=boundEpoch)) {
@@ -3676,7 +3848,7 @@ static void *UnityHostBody(void *raw)
                 gfx(start->surface);surfaceChanged();
             }
             if(!first){resume();focus(true);}
-            everResumed=true;running=true;
+            everResumed=true;running=true;seenFocus=true;
             g_inputReady.store(frame>=4&&start->inject,std::memory_order_release);
             Emit("LIFECYCLE resume done frame=%llu surface=%llu tid=%d",(unsigned long long)frame,(unsigned long long)boundEpoch,(int)syscall(SYS_gettid));
         } else if(running&&bound&&state.surface&&(bound->width!=state.surface->width||bound->height!=state.surface->height)) {
@@ -3696,8 +3868,28 @@ static void *UnityHostBody(void *raw)
         TouchMetrics inputBeforeFrame=TouchSnapshot();
         auto begin=std::chrono::steady_clock::now();
         g_frameSerial=frame;g_frameInProgress=true;g_hangReported=false;
+        /*
+         * Both edges of the call, so a hang reads as an ENTER with no RETURN rather than as silence.
+         * Without the RETURN line we could not tell "the engine is stuck inside" from "the loop left".
+         */
+        const bool traceFrame=g_jniTraceAll.load(std::memory_order_relaxed);
+        if(traceFrame)Emit("RENDER_ENTER frame=%llu",(unsigned long long)frame);
+        g_frameStartNs.store(MonotonicNs(),std::memory_order_relaxed);
         unsigned char more=((unsigned char (*)(void *,void *))start->render)(&g_env,start->player);
+        g_frameStartNs.store(-1,std::memory_order_relaxed);
+        if(traceFrame)Emit("RENDER_RETURN frame=%llu ms=%lld",(unsigned long long)frame,
+            (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-begin).count());
         RecordTouchFrame(inputBeforeFrame,MonotonicNs());
+        /* Frames per second, sampled over a one second window of actual nativeRender calls. */
+        g_frameCount.fetch_add(1,std::memory_order_relaxed);
+        ++fpsWindowFrames;
+        {
+            uint64_t fpsNow=MonotonicNs(),fpsElapsed=fpsNow-fpsWindowStart;
+            if(fpsElapsed>=1000000000ULL) {
+                g_frameRate.store((uint32_t)((uint64_t)fpsWindowFrames*1000000000ULL/fpsElapsed),std::memory_order_relaxed);
+                fpsWindowFrames=0;fpsWindowStart=fpsNow;
+            }
+        }
         if(frame>=1200&&frame%1200==0)ReaLogEntryState();
         if(frame==3 && start->inject){g_inputPlayer=start->player;g_inputInject=start->inject;g_inputReady.store(true,std::memory_order_release);Emit("TOUCH_DIRECT ready; UI-thread JNI injection, original event timestamps");}
         g_frameInProgress=false;
@@ -3717,6 +3909,45 @@ static void *UnityHostBody(void *raw)
 }
 }
 
+extern "C" void ReaFrameStats(uint32_t *fps, unsigned long long *frames)
+{
+    if (fps) *fps = g_frameRate.load(std::memory_order_relaxed);
+    if (frames) *frames = (unsigned long long)g_frameCount.load(std::memory_order_relaxed);
+}
+
+/*
+ * Frame health for the page: which frame the engine is on, how long the frame it is inside has been
+ * running, and how many frames have completed since start. 0 stuck means no frame is in flight right
+ * now (paused, surface gone, engine not started), which is exactly the case that must never be
+ * mistaken for a hang. `frames` lets the page keep its restart watchdog disarmed until the engine has
+ * produced a first frame: a first frame that spends a long time loading assets is normal start-up, not
+ * a deadlock, and restarting there looks like "the app restarted itself after import".
+ */
+extern "C" void ReaFrameHealth(unsigned long long *serial, unsigned int *stuckMs, unsigned long long *frames)
+{
+    if (serial) *serial = (unsigned long long)g_frameSerial.load(std::memory_order_relaxed);
+    if (frames) *frames = (unsigned long long)g_frameCount.load(std::memory_order_relaxed);
+    if (!stuckMs) return;
+    const int64_t started = g_frameStartNs.load(std::memory_order_relaxed);
+    if (started < 0) { *stuckMs = 0; return; }
+    const int64_t elapsedMs = (MonotonicNs() - started) / 1000000;
+    *stuckMs = elapsedMs > 0 ? (unsigned int)elapsedMs : 1;
+}
+
+/*
+ * Move coalescing. The interceptor delivers one Move per finger, and injecting each of them serially
+ * (the injection holds g_touchStateMutex and enters Unity) is what makes many-finger input stall:
+ * ten fingers at 120 Hz is ~1200 injections per second, where a real device delivers one
+ * MotionEvent per frame carrying every pointer.
+ *
+ * Only the injection is gated. The position is always recorded first, so the next injected event -
+ * whichever finger triggers it - carries every pointer at its current place. Gating the state as well
+ * would pin a finger to its last injected position, and because the gate is won by whichever finger
+ * arrives first, the losers would trail further and further behind.
+ */
+static const int64_t kMoveCoalesceNs = 4000000LL;
+static std::atomic<int64_t> g_lastMoveInject{0};
+
 extern "C" void ReaQueueTouch(int action,int id,double x,double y,double sourceTimestamp)
 {
     if(action<0 || action>3 || id<0 || !std::isfinite(x) || !std::isfinite(y) || !g_inputReady.load(std::memory_order_acquire))return;
@@ -3729,6 +3960,17 @@ extern "C" void ReaQueueTouch(int action,int id,double x,double y,double sourceT
             int64_t bootAge=(int64_t)boot.tv_sec*1000000000LL+boot.tv_nsec-stamp;
             if(bootAge>=0 && bootAge<60000000000LL)source=entry-bootAge;
         }
+    }
+    if (action == 2) {
+        const int64_t now = MonotonicNs();
+        const int64_t last = g_lastMoveInject.load(std::memory_order_relaxed);
+        if (last > 0 && now - last < kMoveCoalesceNs) {
+            RecordTouchState({action,id,(float)x,(float)y,source,entry});
+            return;
+        }
+        g_lastMoveInject.store(now, std::memory_order_relaxed);
+    } else {
+        g_lastMoveInject.store(0, std::memory_order_relaxed);
     }
     SubmitTouch({action,id,(float)x,(float)y,source,entry});
 }

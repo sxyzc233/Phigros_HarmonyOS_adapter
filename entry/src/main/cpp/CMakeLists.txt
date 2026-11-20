@@ -12,7 +12,7 @@ include_directories(
 
 add_library(ReaSLES SHARED android_sles_audio.cpp)
 target_link_libraries(ReaSLES PUBLIC libohaudio.so libhilog_ndk.z.so)
-add_library(transprobe SHARED probe.cpp jni_emu.cpp asset_zip.cpp surface.cpp pthread_abi.cpp il2cpp_data.cpp il2cpp_lookup_hook.cpp jni_args_selftest.cpp egl_diagnostics.cpp native_touch.cpp fmod_audio_host.cpp android_network.cpp android_sysconf.cpp engine_state.cpp tap_sdk_bridge.cpp java_preferences.cpp managed_exception_trace.cpp player_platform.cpp video_surface.cpp)
+add_library(transprobe SHARED probe.cpp jni_emu.cpp asset_zip.cpp surface.cpp pthread_abi.cpp il2cpp_data.cpp il2cpp_lookup_hook.cpp jni_args_selftest.cpp egl_diagnostics.cpp native_touch.cpp input_intercept.cpp fmod_audio_host.cpp android_network.cpp android_sysconf.cpp engine_state.cpp tap_sdk_bridge.cpp java_preferences.cpp managed_exception_trace.cpp player_platform.cpp video_surface.cpp)
 
 target_link_libraries(transprobe PUBLIC
     libace_napi.z.so
@@ -23,6 +23,7 @@ target_link_libraries(transprobe PUBLIC
     libEGL.so
     libnative_window.so
     libohaudio.so
+    libohinput.so
     libnative_image.so
 )
 

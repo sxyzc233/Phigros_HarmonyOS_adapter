@@ -1,7 +1,7 @@
 /*
  * il2cpp data directory support.
  *
- * The engine resolves its own assets through the AssetManager (served from the HAP zip), but libil2cpp
+ * The engine resolves its own assets through the AssetManager (served from the imported APK), but libil2cpp
  * reads global-metadata.dat with plain file IO and cannot see inside the archive. So the metadata is
  * extracted once to a real directory and il2cpp_set_data_dir is wrapped: if the path the engine passes
  * does not actually contain the metadata, the prepared directory is substituted and the substitution is
@@ -25,12 +25,15 @@
 #define LOGI(fmt, ...) OH_LOG_Print(LOG_APP, LOG_INFO, LOG_DOMAIN, LOG_TAG, fmt, ##__VA_ARGS__)
 #define LOGW(fmt, ...) OH_LOG_Print(LOG_APP, LOG_WARN, LOG_DOMAIN, LOG_TAG, fmt, ##__VA_ARGS__)
 
-/* Implemented in asset_zip.cpp: resolves a path under the HAP's rawfile assets. */
+/* Implemented in asset_zip.cpp: resolves a path under the imported APK's assets. */
 extern "C" bool ReaAssetOpen(const char *assetPath, int *outFd, int64_t *outOffset, int64_t *outLength);
 
 namespace {
 
-const char *kPreparedDir = "/data/storage/el2/base/files/rea/4.0.1.2";
+/*
+ * Keep metadata version-specific so a new engine never reuses the previous APK metadata.
+ */
+const char *kPreparedDir = "/data/storage/el2/base/files/rea/4.1.0-apk-v1";
 const char *kMetadataAsset = "bin/Data/Managed/Metadata/global-metadata.dat";
 const char *kMetadataName = "global-metadata.dat";
 
@@ -53,7 +56,7 @@ bool FileExists(const std::string &path)
     return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
 }
 
-/* Copies one asset out of the HAP into a real file. Returns false when the asset is unavailable. */
+/* Copies one asset out of the APK into a real file. Returns false when the asset is unavailable. */
 bool ExtractAsset(const char *assetPath, const std::string &destination)
 {
     int fd = -1;

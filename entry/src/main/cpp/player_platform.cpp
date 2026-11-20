@@ -59,6 +59,11 @@ napi_value AppForeground(napi_env e,napi_callback_info info){
     if(n&&napi_get_value_bool(e,a,&foreground)==napi_ok)ReaSetAppForeground(foreground);
     napi_value v;napi_get_undefined(e,&v);return v;
 }
+napi_value AppFocus(napi_env e,napi_callback_info info){
+    size_t n=1;napi_value a;bool focused=true;napi_get_cb_info(e,info,&n,&a,nullptr,nullptr);
+    if(n&&napi_get_value_bool(e,a,&focused)==napi_ok)ReaSetAppFocus(focused);
+    napi_value v;napi_get_undefined(e,&v);return v;
+}
 napi_value SurfaceAvailable(napi_env e,napi_callback_info){napi_value v;napi_get_boolean(e,ReaNativeSurfaceAvailable(),&v);return v;}
 napi_value ClearSurface(napi_env e,napi_callback_info info){
     size_t n=1;napi_value a;napi_get_cb_info(e,info,&n,&a,nullptr,nullptr);
@@ -122,6 +127,7 @@ void ReaHideKeyboard(){std::lock_guard<std::mutex> lock(keyboardMutex);keyboard.
 std::vector<ReaKeyboardEvent> ReaTakeKeyboardEvents(){std::lock_guard<std::mutex> lock(keyboardMutex);std::vector<ReaKeyboardEvent> out;out.swap(events);return out;}
 void ReaExportPlatform(napi_env e,napi_value o){napi_property_descriptor d[]={
     {"setAppForeground",nullptr,AppForeground,nullptr,nullptr,nullptr,napi_default,nullptr},
+    {"setAppFocus",nullptr,AppFocus,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"nativeSurfaceAvailable",nullptr,SurfaceAvailable,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"clearSurface",nullptr,ClearSurface,nullptr,nullptr,nullptr,napi_default,nullptr},
     {"keyboardState",nullptr,ReadKeyboard,nullptr,nullptr,nullptr,napi_default,nullptr},

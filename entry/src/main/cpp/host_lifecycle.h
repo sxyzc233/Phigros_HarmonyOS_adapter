@@ -13,11 +13,14 @@ struct ReaNativeSurface {
 };
 struct ReaLifecycleSnapshot {
     bool foreground = false;
+    /* Window focus inside the foreground, as Android reports it to UnityPlayer. */
+    bool focused = true;
     uint64_t serial = 0, pauseEpoch = 0, surfaceEpoch = 0;
     std::shared_ptr<ReaNativeSurface> surface;
 };
 ReaLifecycleSnapshot ReaReadLifecycle();
 void ReaSetAppForeground(bool foreground);
+void ReaSetAppFocus(bool focused);
 void ReaWaitLifecycle(uint64_t serial, int timeoutMs);
 extern "C" void ReaClearNativeSurface(void *expectedWindow);
 extern "C" void ReaClearSurfaceId(const char *text);

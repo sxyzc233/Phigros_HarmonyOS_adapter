@@ -7,6 +7,10 @@ import sys
 
 ROOT=Path(__file__).resolve().parents[1]
 ALLOWED={'.md','.cpp','.c','.h','.hpp','.inc','.txt','.ets','.ts','.json','.json5','.py','.ps1','.svg'}
+ICON_PATHS={
+    'AppScope/resources/base/media/app_icon.png',
+    'entry/src/main/resources/base/media/icon.png',
+}
 RULES={
     'private key':rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----',
     'GitHub token':rb'(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,})',
@@ -20,20 +24,24 @@ def check():
     for name in filter(None,names):
         p=Path(name);count+=1
         if p.is_absolute() or '..' in p.parts:failures.append((name,'unsafe path'));continue
-        if p.suffix.lower() not in ALLOWED and p.name not in {'LICENSE','.gitignore','.gitattributes'}:
+        if name not in ICON_PATHS and p.suffix.lower() not in ALLOWED and p.name not in {'LICENSE','.gitignore','.gitattributes'}:
             failures.append((name,'unexpected file type'));continue
         if any(part in {'build','libs','rawfile','signing','node_modules','oh_modules','.hvigor','.hvigor-user'} for part in p.parts):
             failures.append((name,'private/generated directory'));continue
         # Scan the actual staged bytes, including changes that differ locally.
         data=subprocess.check_output(['git','show',':'+name],cwd=ROOT)
         total+=len(data)
+        if name in ICON_PATHS:
+            if len(data)>2*1024*1024 or not data.startswith(b'\x89PNG\r\n\x1a\n'):
+                failures.append((name,'invalid or oversized PNG icon'))
+            continue
         if len(data)>2*1024*1024 or b'\0' in data:failures.append((name,'binary/oversized file'))
         for label,pattern in RULES.items():
             if re.search(pattern,data):failures.append((name,label))
     for name,label in failures:print(f'FAIL {name}: {label}')
     if not count:print('FAIL empty Git index');return 1
     if failures:return 1
-    print(f'PASS staged public tree: {count} text/source files, {total} bytes; no matched private data or proprietary binaries.')
+    print(f'PASS staged public tree: {count} files, {total} bytes. PNGs are allowed only at the app icon paths.')
     print('Heuristic scan only; review source provenance and changes as well.')
     return 0
 if __name__=='__main__':sys.exit(check())

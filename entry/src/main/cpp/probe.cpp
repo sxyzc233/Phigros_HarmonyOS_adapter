@@ -312,8 +312,257 @@ napi_value RunAbiTest(napi_env env, napi_callback_info info)
     return out;
 }
 
-napi_value Init(napi_env env, napi_value exports)
+/*
+ * Implemented in asset_zip.cpp: the imported Android APK is the asset source now, so ArkTS must say
+ * where the cache lives and confirm the archive is readable before the engine is handed a surface.
+ */
+extern "C" bool ReaConfigureAssetCache(const char *directory);
+extern "C" bool ReaPrepareImportedAssets();
+/* Implemented in asset_zip.cpp: extraction progress, lock free so polling never blocks it. */
+extern "C" void ReaAssetPreparationStatus(uint64_t *done, uint64_t *total, uint64_t *bytes,
+                                          uint64_t *bytesTotal, int *active);
+
+struct AssetPreparation {
+    napi_deferred deferred = nullptr;
+    napi_async_work work = nullptr;
+    bool okay = false;
+};
+
+/* Runs off the JS thread: the first pass reads the APK's central directory. */
+void PrepareAssets(napi_env env, void *data)
 {
+    AssetPreparation *preparation = static_cast<AssetPreparation *>(data);
+    preparation->okay = ReaPrepareImportedAssets();
+}
+
+void AssetsPrepared(napi_env env, napi_status status, void *data)
+{
+    AssetPreparation *preparation = static_cast<AssetPreparation *>(data);
+    napi_value result = nullptr;
+    napi_get_boolean(env, status == napi_ok && preparation->okay, &result);
+    napi_resolve_deferred(env, preparation->deferred, result);
+    napi_delete_async_work(env, preparation->work);
+    delete preparation;
+}
+
+napi_value ConfigureAssetCache(napi_env env, napi_callback_info info)
+{
+    size_t count = 1;
+    napi_value argument = nullptr;
+    napi_get_cb_info(env, info, &count, &argument, nullptr, nullptr);
+    char text[512] = {0};
+    size_t length = 0;
+    bool okay = false;
+    if (count == 1 && napi_get_value_string_utf8(env, argument, text, sizeof(text), &length) == napi_ok) {
+        okay = ReaConfigureAssetCache(text);
+    }
+    napi_value out = nullptr;
+    napi_get_boolean(env, okay, &out);
+    return out;
+}
+
+napi_value PrepareImportedAssets(napi_env env, napi_callback_info info)
+{
+    napi_deferred deferred = nullptr;
+    napi_value promise = nullptr;
+    AssetPreparation *preparation = nullptr;
+    napi_value name = nullptr;
+
+    if (napi_create_promise(env, &deferred, &promise) == napi_ok) {
+        preparation = new AssetPreparation();
+        preparation->deferred = deferred;
+        napi_create_string_utf8(env, "prepareImportedAssets", NAPI_AUTO_LENGTH, &name);
+        if (napi_create_async_work(env, nullptr, name, PrepareAssets, AssetsPrepared, preparation,
+                                   &preparation->work) == napi_ok) {
+            if (napi_queue_async_work(env, preparation->work) == napi_ok) return promise;
+            napi_delete_async_work(env, preparation->work);
+        }
+        delete preparation;
+    }
+
+    napi_value out = nullptr;
+    napi_get_boolean(env, false, &out);
+    return out;
+}
+
+/*
+ * Progress of the up-front extraction, for the import screen. Polled from ArkTS while the worker
+ * runs, so it only reads the counters and never touches the asset locks.
+ */
+napi_value AssetPreparationStatus(napi_env env, napi_callback_info info)
+{
+    uint64_t done = 0, total = 0, bytes = 0, bytesTotal = 0;
+    int active = 0;
+    ReaAssetPreparationStatus(&done, &total, &bytes, &bytesTotal, &active);
+
+    napi_value out = nullptr;
+    napi_value value = nullptr;
+    napi_create_object(env, &out);
+    napi_get_boolean(env, active != 0, &value);
+    napi_set_named_property(env, out, "active", value);
+    napi_create_int64(env, (int64_t)done, &value);
+    napi_set_named_property(env, out, "done", value);
+    napi_create_int64(env, (int64_t)total, &value);
+    napi_set_named_property(env, out, "total", value);
+    napi_create_int64(env, (int64_t)bytes, &value);
+    napi_set_named_property(env, out, "bytes", value);
+    napi_create_int64(env, (int64_t)bytesTotal, &value);
+    napi_set_named_property(env, out, "bytesTotal", value);
+    return out;
+}
+
+/*
+ * Implemented in input_intercept.cpp: exclusive touch through INTERCEPT_INPUT_EVENT. While it is
+ * installed the window stops receiving input, so the interceptor is what feeds the engine.
+ */
+extern "C" bool ReaInputInterceptStart(int *outResult);
+extern "C" bool ReaInputInterceptStop();
+extern "C" void ReaInputInterceptState(int *active, int *lastResult, unsigned long long *events);
+
+napi_value StartInputIntercept(napi_env env, napi_callback_info info)
+{
+    int result = -1;
+    const bool okay = ReaInputInterceptStart(&result);
+    napi_value out = nullptr;
+    napi_value value = nullptr;
+    napi_create_object(env, &out);
+    napi_get_boolean(env, okay, &value);
+    napi_set_named_property(env, out, "ok", value);
+    napi_create_int32(env, result, &value);
+    napi_set_named_property(env, out, "result", value);
+    return out;
+}
+
+napi_value StopInputIntercept(napi_env env, napi_callback_info info)
+{
+    napi_value out = nullptr;
+    napi_get_boolean(env, ReaInputInterceptStop(), &out);
+    return out;
+}
+
+napi_value InputInterceptState(napi_env env, napi_callback_info info)
+{
+    int active = 0, lastResult = -1;
+    unsigned long long events = 0;
+    ReaInputInterceptState(&active, &lastResult, &events);
+
+    napi_value out = nullptr;
+    napi_value value = nullptr;
+    napi_create_object(env, &out);
+    napi_get_boolean(env, active != 0, &value);
+    napi_set_named_property(env, out, "active", value);
+    napi_create_int32(env, lastResult, &value);
+    napi_set_named_property(env, out, "result", value);
+    napi_create_int64(env, (int64_t)events, &value);
+    napi_set_named_property(env, out, "events", value);
+    return out;
+}
+
+/*
+ * Implemented in jni_emu.cpp: the engine render loop reports its own frame rate. This is the rate at
+ * which nativeRender actually returns, not the display's refresh capability.
+ */
+extern "C" void ReaFrameStats(uint32_t *fps, unsigned long long *frames);
+
+napi_value FrameStats(napi_env env, napi_callback_info info)
+{
+    uint32_t fps = 0;
+    unsigned long long frames = 0;
+    ReaFrameStats(&fps, &frames);
+
+    napi_value out = nullptr;
+    napi_value value = nullptr;
+    napi_create_object(env, &out);
+    napi_create_uint32(env, fps, &value);
+    napi_set_named_property(env, out, "fps", value);
+    napi_create_int64(env, (int64_t)frames, &value);
+    napi_set_named_property(env, out, "frames", value);
+    return out;
+}
+
+/*
+ * Runtime frame-rate request from the options sheet. 0 means the compositor accepted the range;
+ * a negative value means the request was refused or deferred (no surface yet).
+ */
+extern "C" int ReaRequestFrameRate(int hz);
+
+napi_value RequestFrameRate(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    int32_t hz = 0;
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1 || napi_get_value_int32(env, argv[0], &hz) != napi_ok) {
+        napi_value failed = nullptr;
+        napi_create_int32(env, -1, &failed);
+        return failed;
+    }
+    napi_value out = nullptr;
+    napi_create_int32(env, ReaRequestFrameRate(hz), &out);
+    return out;
+}
+
+/*
+ * Implemented in jni_emu.cpp. Detailed tracing is what pins down a hang, and it is heavy: every
+ * framework call plus both edges of nativeRender lands in hilog. Off unless the debug switch is on.
+ */
+extern "C" void ReaSetJniTrace(bool on);
+extern "C" bool ReaJniTraceState();
+
+napi_value SetJniTrace(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value args[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    bool on = false;
+    if (argc >= 1) napi_get_value_bool(env, args[0], &on);
+    ReaSetJniTrace(on);
+    napi_value out = nullptr;
+    napi_get_boolean(env, ReaJniTraceState(), &out);
+    return out;
+}
+
+/*
+ * Frame health. stuckMs is 0 whenever no frame is in flight, so a pause, a lost surface or a
+ * not-yet-started engine can never look like a hang.
+ */
+extern "C" void ReaFrameHealth(unsigned long long *serial, unsigned int *stuckMs, unsigned long long *frames);
+
+napi_value FrameHealth(napi_env env, napi_callback_info info)
+{
+    unsigned long long serial = 0;
+    unsigned int stuckMs = 0;
+    unsigned long long frames = 0;
+    ReaFrameHealth(&serial, &stuckMs, &frames);
+
+    napi_value out = nullptr;
+    napi_value value = nullptr;
+    napi_create_object(env, &out);
+    napi_create_int64(env, (int64_t)serial, &value);
+    napi_set_named_property(env, out, "serial", value);
+    napi_create_uint32(env, stuckMs, &value);
+    napi_set_named_property(env, out, "stuckMs", value);
+    napi_create_int64(env, (int64_t)frames, &value);
+    napi_set_named_property(env, out, "frames", value);
+    return out;
+}
+
+/*
+ * Links the engine asked the platform to open (Application.OpenURL). Empty string means nothing is
+ * pending; the page drains this on its tick and hands the URL to the system handler.
+ */
+extern "C" int ReaTakeExternalOpen(char *out, int capacity);
+
+napi_value TakeExternalOpen(napi_env env, napi_callback_info info)
+{
+    char buffer[2048];
+    const int length = ReaTakeExternalOpen(buffer, (int)sizeof(buffer));
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, length > 0 ? buffer : "", (size_t)(length > 0 ? length : 0), &out);
+    return out;
+}
+
+napi_value Init(napi_env env, napi_value exports){
     napi_property_descriptor descriptors[] = {
         {"run", nullptr, Run, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"jni", nullptr, RunJni, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -337,6 +586,17 @@ napi_value Init(napi_env env, napi_value exports)
         {"setSdkAuthState", nullptr, SetSdkAuthState, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseBridge", nullptr, ReleaseBridge, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"publishCrashReport", nullptr, PublishCrashReport, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"configureAssetCache", nullptr, ConfigureAssetCache, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"prepareImportedAssets", nullptr, PrepareImportedAssets, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"assetPreparationStatus", nullptr, AssetPreparationStatus, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"startInputIntercept", nullptr, StartInputIntercept, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"stopInputIntercept", nullptr, StopInputIntercept, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"inputInterceptState", nullptr, InputInterceptState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"frameStats", nullptr, FrameStats, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"requestFrameRate", nullptr, RequestFrameRate, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setJniTrace", nullptr, SetJniTrace, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"frameHealth", nullptr, FrameHealth, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"takeExternalOpen", nullptr, TakeExternalOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(descriptors)/sizeof(descriptors[0]), descriptors);
     ReaExportPlatform(env,exports);

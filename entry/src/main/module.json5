@@ -30,7 +30,7 @@
         "description": "$string:EntryAbility_desc",
         "icon": "$media:icon",
         "label": "$string:EntryAbility_label",
-        "startWindowIcon": "$media:rea_start_blank",
+        "startWindowIcon": "$media:icon",
         "startWindowBackground": "$color:start_window_background",
         "orientation": "auto_rotation_landscape",
         "exported": true,
@@ -69,6 +69,7 @@
     ],
     "requestPermissions": [
       { "name": "ohos.permission.GET_NETWORK_INFO" },
+      { "name": "ohos.permission.INTERCEPT_INPUT_EVENT" },
       {
         "name": "ohos.permission.INTERNET",
         "usedScene": {

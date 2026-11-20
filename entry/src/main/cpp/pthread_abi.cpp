@@ -141,19 +141,34 @@ void ResolveReal()
 
 const int kTableSize = 1024;
 
+/*
+ * Entries are never erased. MutexFor hands out &entry->mutex and only then releases the table lock,
+ * so a destroy that erased the node would leave that pointer dangling on another thread - a
+ * use-after-free that surfaced as SIGSEGV_MAPERR inside musl's mutex fast path during audio/engine
+ * start-up. The native object is destroyed, the storage stays, and the next user of the same foreign
+ * address re-initialises it. `live` is what pthread_mutex_destroy/init actually flip.
+ *
+ * Memory cost is one node per foreign address ever seen (peaks stay in the low hundreds).
+ */
 struct MutexEntry {
     uintptr_t key;
     pthread_mutex_t mutex;
+    bool live = false;
+    long long deadAtMs = 0;
 };
 
 struct CondEntry {
     uintptr_t key;
     pthread_cond_t cond;
+    bool live = false;
+    long long deadAtMs = 0;
 };
 
 struct RwEntry {
     uintptr_t key;
     pthread_rwlock_t lock;
+    bool live = false;
+    long long deadAtMs = 0;
 };
 
 // Node ownership keeps native lock addresses stable as the registry grows.
@@ -162,6 +177,8 @@ std::map<uintptr_t,std::unique_ptr<MutexEntry>> g_mutexes;
 std::map<uintptr_t,std::unique_ptr<CondEntry>> g_conds;
 std::map<uintptr_t,std::unique_ptr<RwEntry>> g_rwlocks;
 size_t g_mutexPeak=0,g_condPeak=0,g_rwPeak=0;
+/* How often a destroyed lock was re-initialised for the next user of the same address. */
+unsigned long g_mutexReuse=0,g_condReuse=0,g_rwReuse=0;
 constexpr uintptr_t kDeletedSem=~uintptr_t(0);
 
 struct SemEntry {
@@ -200,16 +217,78 @@ void UnlockTable()
     if (g_tableMaskSaved) pthread_sigmask(SIG_SETMASK, &g_tablePreviousMask, nullptr);
 }
 
-pthread_mutex_t *MutexFor(void *foreign)
+/*
+ * Keeping dead nodes alive is what makes a handed-out pointer safe, but a foreign address that never
+ * recurs would sit in the table for the life of the process - a busy heap churns tens of thousands a
+ * minute. Reclaim only after a grace period: a pointer lives for the few instructions between the
+ * table unlock and the real pthread call, so two seconds is many orders of magnitude of margin.
+ */
+constexpr size_t kReclaimThreshold = 2048;
+constexpr size_t kReclaimBatch = 512;
+constexpr long long kReclaimGraceMs = 2000;
+
+static long long ReclaimClockMs()
 {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+template <typename Table>
+size_t ReclaimDeadLocked(Table &table, size_t batch, long long now)
+{
+    size_t removed = 0;
+    for (auto it = table.begin(); it != table.end() && removed < batch;) {
+        auto *entry = it->second.get();
+        if (!entry->live && entry->deadAtMs > 0 && now - entry->deadAtMs >= kReclaimGraceMs) {
+            it = table.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
+/* Caller holds the table lock. Returns immediately while the tables are small. */
+void ReclaimDeadTables()
+{
+    if (g_mutexes.size() < kReclaimThreshold && g_conds.size() < kReclaimThreshold &&
+        g_rwlocks.size() < kReclaimThreshold) return;
+    const long long now = ReclaimClockMs();
+    size_t removed = ReclaimDeadLocked(g_mutexes, kReclaimBatch, now);
+    removed += ReclaimDeadLocked(g_conds, kReclaimBatch / 2, now);
+    removed += ReclaimDeadLocked(g_rwlocks, kReclaimBatch / 2, now);
+    if (removed) {
+        LOGI("SYNC_RECLAIM removed=%{public}zu mutex=%{public}zu cond=%{public}zu rw=%{public}zu",
+             removed, g_mutexes.size(), g_conds.size(), g_rwlocks.size());
+    }
+}
+
+pthread_mutex_t *MutexFor(void *foreign){
     uintptr_t key = (uintptr_t)foreign;
     if (!key) return nullptr;
-    auto found=g_mutexes.find(key);if(found!=g_mutexes.end())return &found->second->mutex;
+    auto found=g_mutexes.find(key);
+    if(found!=g_mutexes.end()){
+        MutexEntry *entry=found->second.get();
+        if(entry->live)return &entry->mutex;
+        // Destroyed earlier; the storage is still owned by the table so the address stays valid for
+        // any pointer another thread is already holding. Re-initialise instead of allocating anew.
+        pthread_mutexattr_t again;pthread_mutexattr_init(&again);
+        pthread_mutexattr_settype(&again,PTHREAD_MUTEX_RECURSIVE);
+        int rc=g_real.mutex_init(&entry->mutex,&again);pthread_mutexattr_destroy(&again);
+        if(rc){errno=rc;return nullptr;}
+        entry->live=true;entry->deadAtMs=0;
+        if(++g_mutexReuse<=8)LOGI("SYNC_REUSE mutex key=0x%{public}lx count=%{public}lu",
+                                 (unsigned long)key,g_mutexReuse);
+        return &entry->mutex;
+    }
     std::unique_ptr<MutexEntry> entry(new(std::nothrow) MutexEntry{});if(!entry){errno=ENOMEM;return nullptr;}
     entry->key=key;pthread_mutexattr_t attr;pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr,PTHREAD_MUTEX_RECURSIVE);
     int result=g_real.mutex_init(&entry->mutex,&attr);pthread_mutexattr_destroy(&attr);
     if(result){errno=result;return nullptr;}
+    entry->live=true;
     auto *native=&entry->mutex;
     try{g_mutexes.emplace(key,std::move(entry));}catch(const std::bad_alloc &){if(entry)g_real.mutex_destroy(&entry->mutex);errno=ENOMEM;return nullptr;}
     if(g_mutexes.size()>g_mutexPeak)g_mutexPeak=g_mutexes.size();return native;
@@ -237,9 +316,19 @@ pthread_rwlock_t *RwlockFor(void *foreign)
 {
     uintptr_t key = (uintptr_t)foreign;
     if (!key) return nullptr;
-    auto found=g_rwlocks.find(key);if(found!=g_rwlocks.end())return &found->second->lock;
+    auto found=g_rwlocks.find(key);
+    if(found!=g_rwlocks.end()){
+        RwEntry *entry=found->second.get();
+        if(entry->live)return &entry->lock;
+        int rc=g_real.rwlock_init(&entry->lock,nullptr);if(rc){errno=rc;return nullptr;}
+        entry->live=true;entry->deadAtMs=0;
+        if(++g_rwReuse<=8)LOGI("SYNC_REUSE rwlock key=0x%{public}lx count=%{public}lu",
+                               (unsigned long)key,g_rwReuse);
+        return &entry->lock;
+    }
     std::unique_ptr<RwEntry> entry(new(std::nothrow) RwEntry{});if(!entry){errno=ENOMEM;return nullptr;}
     entry->key=key;int result=g_real.rwlock_init(&entry->lock,nullptr);if(result){errno=result;return nullptr;}
+    entry->live=true;
     auto *native=&entry->lock;
     try{g_rwlocks.emplace(key,std::move(entry));}catch(const std::bad_alloc &){if(entry)g_real.rwlock_destroy(&entry->lock);errno=ENOMEM;return nullptr;}
     if(g_rwlocks.size()>g_rwPeak)g_rwPeak=g_rwlocks.size();return native;
@@ -249,9 +338,19 @@ pthread_cond_t *CondFor(void *foreign)
 {
     uintptr_t key = (uintptr_t)foreign;
     if (!key) return nullptr;
-    auto found=g_conds.find(key);if(found!=g_conds.end())return &found->second->cond;
+    auto found=g_conds.find(key);
+    if(found!=g_conds.end()){
+        CondEntry *entry=found->second.get();
+        if(entry->live)return &entry->cond;
+        int rc=g_real.cond_init(&entry->cond,nullptr);if(rc){errno=rc;return nullptr;}
+        entry->live=true;entry->deadAtMs=0;
+        if(++g_condReuse<=8)LOGI("SYNC_REUSE cond key=0x%{public}lx count=%{public}lu",
+                                 (unsigned long)key,g_condReuse);
+        return &entry->cond;
+    }
     std::unique_ptr<CondEntry> entry(new(std::nothrow) CondEntry{});if(!entry){errno=ENOMEM;return nullptr;}
     entry->key=key;int result=g_real.cond_init(&entry->cond,nullptr);if(result){errno=result;return nullptr;}
+    entry->live=true;
     auto *native=&entry->cond;
     try{g_conds.emplace(key,std::move(entry));}catch(const std::bad_alloc &){if(entry)g_real.cond_destroy(&entry->cond);errno=ENOMEM;return nullptr;}
     if(g_conds.size()>g_condPeak)g_condPeak=g_conds.size();return native;
@@ -307,7 +406,14 @@ extern "C" int rea_pthread_mutex_destroy(void *mutex)
     uintptr_t key = (uintptr_t)mutex;
     LockTable();
     int result=0;auto found=g_mutexes.find(key);
-    if(found!=g_mutexes.end()){result=g_real.mutex_destroy(&found->second->mutex);if(result==0)g_mutexes.erase(found);}
+    if(found!=g_mutexes.end()){
+        MutexEntry *entry=found->second.get();
+        // Only the native object dies here; the node stays so pointers already handed out elsewhere
+        // remain readable. MutexFor re-initialises it for the next user of this address, and
+        // ReclaimDeadTables drops it once no pointer could still be in flight.
+        if(entry->live){result=g_real.mutex_destroy(&entry->mutex);if(result==0){entry->live=false;entry->deadAtMs=ReclaimClockMs();}}
+        ReclaimDeadTables();
+    }
     UnlockTable();
     return result;
 }
@@ -335,8 +441,7 @@ static long long NowMs(void)
     return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-/* Wakes a wait that has been outstanding for too long, as nothing else will. */
-static void *CondRescue(void *raw)
+/* Wakes a wait that has been outstanding for too long, as nothing else will. */static void *CondRescue(void *raw)
 {
     (void)raw;
     for (;;) {
@@ -450,7 +555,11 @@ extern "C" int rea_pthread_cond_destroy(void *cond)
     uintptr_t key = (uintptr_t)cond;
     LockTable();
     int result=0;auto found=g_conds.find(key);
-    if(found!=g_conds.end()){result=g_real.cond_destroy(&found->second->cond);if(result==0)g_conds.erase(found);}
+    if(found!=g_conds.end()){
+        CondEntry *entry=found->second.get();
+        if(entry->live){result=g_real.cond_destroy(&entry->cond);if(result==0){entry->live=false;entry->deadAtMs=ReclaimClockMs();}}
+        ReclaimDeadTables();
+    }
     UnlockTable();
     return result;
 }
@@ -498,7 +607,11 @@ extern "C" int rea_pthread_rwlock_destroy(void *lock)
     uintptr_t key = (uintptr_t)lock;
     LockTable();
     int result=0;auto found=g_rwlocks.find(key);
-    if(found!=g_rwlocks.end()){result=g_real.rwlock_destroy(&found->second->lock);if(result==0)g_rwlocks.erase(found);}
+    if(found!=g_rwlocks.end()){
+        RwEntry *entry=found->second.get();
+        if(entry->live){result=g_real.rwlock_destroy(&entry->lock);if(result==0){entry->live=false;entry->deadAtMs=ReclaimClockMs();}}
+        ReclaimDeadTables();
+    }
     UnlockTable();
     return result;
 }
@@ -727,8 +840,10 @@ extern "C" void ReaLogSyncState(){
     mutexPeak=g_mutexPeak;condPeak=g_condPeak;rwPeak=g_rwPeak;
     for(const auto &entry:g_sems)if(entry.key&&entry.key!=kDeletedSem)++semaphores;
     UnlockTable();
-    LOGI("SYNC_REGISTRY mutex=%{public}zu cond=%{public}zu rw=%{public}zu sem=%{public}zu peaks=%{public}zu/%{public}zu/%{public}zu growable=1",
-         mutexes,conditions,rwlocks,semaphores,mutexPeak,condPeak,rwPeak);
+    LOGI("SYNC_REGISTRY mutex=%{public}zu cond=%{public}zu rw=%{public}zu sem=%{public}zu peaks=%{public}zu/%{public}zu/%{public}zu reuse=%{public}lu/%{public}lu/%{public}lu growable=1",
+         mutexes,conditions,rwlocks,semaphores,mutexPeak,condPeak,rwPeak,
+         __atomic_load_n(&g_mutexReuse,__ATOMIC_RELAXED),__atomic_load_n(&g_condReuse,__ATOMIC_RELAXED),
+         __atomic_load_n(&g_rwReuse,__ATOMIC_RELAXED));
 }
 
 extern "C" int rea_sem_getvalue(void *sem, int *value)
