@@ -127,8 +127,12 @@ extern "C" const char *ReaRunTracedGfx();
 extern "C" const char *ReaBreakpointTrace();
 extern "C" const char *ReaAbiSelfTest();
 extern "C" void ReaQueueTouch(int,int,double,double,double);
+extern "C" void ReaQueueTouchSnapshot(int,int,double,double,const int*,const double*,const double*,int,double);
 extern "C" bool ReaNativeTouchAvailable();
 extern "C" void ReaBindNativeTouch(napi_env,napi_value);
+/* Touch options owned by jni_emu.cpp; the options sheet flips them live. */
+extern "C" void ReaSetTouchOption(const char *,bool);
+extern "C" bool ReaTouchOption(const char *);
 extern "C" void ReaSetSystemLocale(const char *);
 extern "C" void ReaSetNetworkType(int);
 extern "C" void ReaSetSystemProxy(const char *);
@@ -216,6 +220,44 @@ napi_value Touch(napi_env env,napi_callback_info info)
     if(count==5 && napi_get_value_int32(env,args[0],&action)==napi_ok &&
         napi_get_value_int32(env,args[1],&id)==napi_ok && napi_get_value_double(env,args[2],&x)==napi_ok &&
         napi_get_value_double(env,args[3],&y)==napi_ok && napi_get_value_double(env,args[4],&timestamp)==napi_ok)ReaQueueTouch(action,id,x,y,timestamp);
+    napi_value result;napi_get_undefined(env,&result);return result;
+}
+
+napi_value TouchSnapshot(napi_env env,napi_callback_info info)
+{
+    /*
+     * touchSnapshot(type, changedId, changedX, changedY, ids[], xs[], ys[], timestamp)
+     *
+     * The ArkTS fallback path has the same problem as the native callback: one onTouch per frame means
+     * only the frame's last touch event arrives, so changedTouches cannot describe a frame in which
+     * two fingers changed. event.touches carries the whole pressed set, and the native side reconciles
+     * it against what the engine holds.
+     */
+    size_t count=8;napi_value args[8]{};
+    napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+    if(count<8){napi_value out;napi_get_undefined(env,&out);return out;}
+    int32_t action=2,changedId=-1;double changedX=0,changedY=0,timestamp=0;
+    napi_get_value_int32(env,args[0],&action);
+    napi_get_value_int32(env,args[1],&changedId);
+    napi_get_value_double(env,args[2],&changedX);
+    napi_get_value_double(env,args[3],&changedY);
+    napi_get_value_double(env,args[7],&timestamp);
+    const size_t kMax=10;
+    uint32_t length=0;
+    if(napi_get_array_length(env,args[4],&length)!=napi_ok)length=0;
+    if(length>kMax)length=(uint32_t)kMax;
+    int ids[kMax]{};
+    double xs[kMax]{},ys[kMax]{};
+    int n=0;
+    for(uint32_t i=0;i<length;++i){
+        napi_value value;int32_t id=0;double x=0,y=0;
+        if(napi_get_element(env,args[4],i,&value)!=napi_ok || napi_get_value_int32(env,value,&id)!=napi_ok)continue;
+        if(napi_get_element(env,args[5],i,&value)!=napi_ok || napi_get_value_double(env,value,&x)!=napi_ok)continue;
+        if(napi_get_element(env,args[6],i,&value)!=napi_ok || napi_get_value_double(env,value,&y)!=napi_ok)continue;
+        if(id<0)continue;
+        ids[n]=id;xs[n]=x;ys[n]=y;++n;
+    }
+    ReaQueueTouchSnapshot(action,changedId,changedX,changedY,ids,xs,ys,n,timestamp);
     napi_value result;napi_get_undefined(env,&result);return result;
 }
 
@@ -562,6 +604,17 @@ napi_value TakeExternalOpen(napi_env env, napi_callback_info info)
     return out;
 }
 
+napi_value SetTouchOption(napi_env env,napi_callback_info info)
+{
+    size_t count=2;napi_value args[2];napi_get_cb_info(env,info,&count,args,nullptr,nullptr);
+    char name[64]={0};size_t length=0;bool on=false;
+    if(count==2 && napi_get_value_string_utf8(env,args[0],name,sizeof(name),&length)==napi_ok &&
+       napi_get_value_bool(env,args[1],&on)==napi_ok){
+        ReaSetTouchOption(name,on);
+    }
+    return nullptr;
+}
+
 napi_value Init(napi_env env, napi_value exports){
     napi_property_descriptor descriptors[] = {
         {"run", nullptr, Run, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -576,6 +629,7 @@ napi_value Init(napi_env env, napi_value exports){
         {"breakpoint", nullptr, RunBreakpoint, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"abitest", nullptr, RunAbiTest, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"touch", nullptr, Touch, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"touchSnapshot", nullptr, TouchSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"nativeTouchAvailable", nullptr, NativeTouchAvailable, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setSystemLocale", nullptr, SetSystemLocale, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setNetworkType", nullptr, SetNetworkType, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -597,7 +651,28 @@ napi_value Init(napi_env env, napi_value exports){
         {"setJniTrace", nullptr, SetJniTrace, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"frameHealth", nullptr, FrameHealth, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"takeExternalOpen", nullptr, TakeExternalOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setTouchOption", nullptr, SetTouchOption, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
+    /*
+     * Build identity. Which file the loader actually mapped - and how many bytes it has - is the only
+     * way to prove from a log that a freshly installed package is really the one running; a stale
+     * process or a stale package both look identical to "the new trace is silent".
+     */
+    {
+        Dl_info info{};
+        const char *path = (dladdr((void *)&Init, &info) && info.dli_fname) ? info.dli_fname : "(unnamed)";
+        struct stat st{};
+        const long size = stat(path, &st) == 0 ? (long)st.st_size : -1;
+        LOGI("TOUCH_BUILD v13 so=%{public}s size=%{public}ld", path, size);
+        LOGI("SYNC_DEADLOCK_FIX on=1 table_reentrant=1 wait_unmasked=1 reclaim_ms=250");
+    }
+    /*
+     * Which shaping switches are live. The defaults changed in v11, and "the new package is still
+     * stuttering" is impossible to judge without knowing whether the old switches are still on.
+     */
+    LOGI("TOUCH_OPTIONS predict=%{public}d jitter=%{public}d coalesce=%{public}d dupe=%{public}d tool=%{public}d",
+         (int)ReaTouchOption("predict"), (int)ReaTouchOption("jitter"), (int)ReaTouchOption("coalesce"),
+         (int)ReaTouchOption("dupeRecover"), (int)ReaTouchOption("toolFilter"));
     napi_define_properties(env, exports, sizeof(descriptors)/sizeof(descriptors[0]), descriptors);
     ReaExportPlatform(env,exports);
     ReaBindNativeTouch(env,exports);

@@ -35,10 +35,17 @@
 #include <cerrno>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <vector>
 #include <new>
 #include <sys/socket.h>
+/* Spin hint for the mapping-table lock: one cycle on the core, never a syscall. */
+#if defined(__aarch64__)
+#define REA_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define REA_CPU_RELAX() __asm__ __volatile__("" ::: "memory")
+#endif
 struct AndroidAddrInfo;
 extern "C" int rea_getaddrinfo(const char *,const char *,const AndroidAddrInfo *,AndroidAddrInfo **);
 extern "C" void rea_freeaddrinfo(AndroidAddrInfo *);
@@ -173,9 +180,14 @@ struct RwEntry {
 
 // Node ownership keeps native lock addresses stable as the registry grows.
 // A fixed 1024-entry pool exhausted during ordinary song/resource loading.
-std::map<uintptr_t,std::unique_ptr<MutexEntry>> g_mutexes;
-std::map<uintptr_t,std::unique_ptr<CondEntry>> g_conds;
-std::map<uintptr_t,std::unique_ptr<RwEntry>> g_rwlocks;
+/*
+ * Hash tables, not ordered maps: every lock operation in the process passes through these lookups, and
+ * the tables sit at a few thousand entries once the engine has loaded a song, where a tree lookup is
+ * eleven dependent branch misses under a lock that every other thread also wants.
+ */
+std::unordered_map<uintptr_t,std::unique_ptr<MutexEntry>> g_mutexes;
+std::unordered_map<uintptr_t,std::unique_ptr<CondEntry>> g_conds;
+std::unordered_map<uintptr_t,std::unique_ptr<RwEntry>> g_rwlocks;
 size_t g_mutexPeak=0,g_condPeak=0,g_rwPeak=0;
 /* How often a destroyed lock was re-initialised for the next user of the same address. */
 unsigned long g_mutexReuse=0,g_condReuse=0,g_rwReuse=0;
@@ -192,29 +204,132 @@ SemEntry g_sems[kTableSize];
 int g_spin = 0;
 static thread_local sigset_t g_tablePreviousMask;
 static thread_local bool g_tableMaskSaved = false;
+static thread_local int g_threadTid = 0;
 static int g_tableOwnerTid = 0;
+/*
+ * Diagnostics that must never run with the mapping lock held.
+ *
+ * The reclaim sweep runs while the lock is held (it has to: it edits the tables). Its old
+ * SYNC_RECLAIM line printed from inside that critical section, and hilog is a blocking write into the
+ * log socket: when the log service is behind, that write waits, and every pthread call in the process -
+ * including the audio thread's - waits behind it. That is a multi-second freeze of picture *and* sound.
+ * v12 keeps the sweep and drops the line; a lock wait long enough to matter is reported by
+ * PTHREAD_LOCK_STALL instead, which is printed from the spinning thread and holds nothing.
+ */
+static long long ReclaimNowNs()
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+static std::atomic<int> g_spinStallLogs{0};
+
+/*
+ * Depth of ownership for the mapping-table lock, so the same thread cannot wait on itself.
+ *
+ * The IL2CPP GC suspends foreign threads with SIGPWR and its handler can call sem_post through this
+ * adapter. If that handler fires on a thread that already owns the table, re-entering this lock must
+ * not wait: the table is already held exclusively by this thread, so recursion is the correct answer.
+ */
+static thread_local int g_tableDepth = 0;
+/* Slowest wait this thread paid for the table on its last acquisition, kept for the diagnostic that
+ * UnlockTable prints after the lock is already gone (never from inside the critical section). */
+static thread_local long long g_tableWaitNs = 0;
+static thread_local int g_tableWaitSpins = 0;
+static thread_local int g_tableWaitOwner = 0;
+static std::atomic<long long> g_lastStallLogNs{0};
 
 void LockTable()
 {
-    // The bundled IL2CPP GC suspends foreign threads with SIGPWR (30).
-    // A suspend handler can call sem_post through this adapter. Never let it
-    // suspend a thread while that thread owns the adapter's mapping-table lock.
-    // Restore the exact previous mask after releasing the lock.
+    if (g_tableDepth > 0) {
+        ++g_tableDepth;
+        return;
+    }
     sigset_t blocked;
     sigemptyset(&blocked);
     sigaddset(&blocked, SIGPWR);
-    g_tableMaskSaved = pthread_sigmask(SIG_BLOCK, &blocked, &g_tablePreviousMask) == 0;
-    while (__atomic_test_and_set(&g_spin, __ATOMIC_ACQUIRE)) {
-        /* spin */
+    const bool saved = pthread_sigmask(SIG_BLOCK, &blocked, &g_tablePreviousMask) == 0;
+    int spins = 0;
+    const int ownerBefore = __atomic_load_n(&g_tableOwnerTid, __ATOMIC_RELAXED);
+    if (__atomic_test_and_set(&g_spin, __ATOMIC_ACQUIRE)) {
+        /*
+         * Contended. Never wait with SIGPWR masked: a waiter that masks the suspend signal cannot
+         * acknowledge the GC's suspend request, and a suspended owner cannot release the lock, so the
+         * two sides deadlocked until a watchdog broke it - which showed up as repeated whole-process
+         * freezes of one to two seconds during play, picture and audio together.
+         *
+         * The mask is restored before any waiting happens, so this thread owns nothing while it waits
+         * and can be suspended safely: GC finishes, the owner resumes, releases, and the waiter wakes.
+         */
+        if (saved) pthread_sigmask(SIG_SETMASK, &g_tablePreviousMask, nullptr);
+        /* The critical section is a couple of hash lookups, so brief contention usually clears within
+         * a few hundred cycles: spin unmasked first (a spinning waiter owns nothing and is still
+         * suspendable), and only fall into a sleeping wait once that is clearly not going to happen. */
+        int relax = 0;
+        for (; relax < 128; ++relax) {
+            if (!__atomic_test_and_set(&g_spin, __ATOMIC_ACQUIRE)) break;
+            REA_CPU_RELAX();
+        }
+        long long waitNs = 0;
+        if (relax == 128) {
+            const long long startNs = ReclaimNowNs();
+            while (__atomic_test_and_set(&g_spin, __ATOMIC_ACQUIRE)) {
+                usleep(20);
+                ++spins;
+            }
+            waitNs = ReclaimNowNs() - startNs;
+        }
+        /* Ownership first, mask second: a handler firing in that window re-enters through
+         * g_tableDepth instead of deadlocking on a lock this thread already holds. */
+        g_tableDepth = 1;
+        g_tableMaskSaved = saved && pthread_sigmask(SIG_BLOCK, &blocked, &g_tablePreviousMask) == 0;
+        g_tableWaitNs = waitNs;
+        g_tableWaitSpins = spins;
+        g_tableWaitOwner = ownerBefore;
+    } else {
+        g_tableDepth = 1;
+        g_tableMaskSaved = saved;
+        g_tableWaitNs = 0;
+        g_tableWaitSpins = 0;
+        g_tableWaitOwner = 0;
     }
-    __atomic_store_n(&g_tableOwnerTid, (int)syscall(SYS_gettid), __ATOMIC_RELEASE);
+    /* The owner id is only used for the re-entrancy check; a thread's tid never changes, so read it
+     * once per thread instead of paying a syscall on every lock operation in the process. */
+    if (!g_threadTid) g_threadTid = (int)syscall(SYS_gettid);
+    __atomic_store_n(&g_tableOwnerTid, g_threadTid, __ATOMIC_RELEASE);
 }
 
 void UnlockTable()
 {
+    if (g_tableDepth > 1) {
+        --g_tableDepth;
+        return;
+    }
+    g_tableDepth = 0;
     __atomic_store_n(&g_tableOwnerTid, 0, __ATOMIC_RELEASE);
     __atomic_clear(&g_spin, __ATOMIC_RELEASE);
     if (g_tableMaskSaved) pthread_sigmask(SIG_SETMASK, &g_tablePreviousMask, nullptr);
+    /*
+     * Stall diagnostic, now printed only after the lock is released and the mask restored: a waiter
+     * that logs while spinning makes things worse, because hilog is a blocking write into the log
+     * socket behind one process-wide lock. Reporting the wait that already happened costs one line
+     * and holds nothing. Throttled to one line per five seconds, twenty lines per process.
+     */
+    if (g_tableWaitNs > 150000000LL) {
+        const long long waited = g_tableWaitNs;
+        const int spins = g_tableWaitSpins;
+        const int owner = g_tableWaitOwner;
+        g_tableWaitNs = 0;
+        const long long now = ReclaimNowNs();
+        const long long last = g_lastStallLogNs.load(std::memory_order_relaxed);
+        if ((last == 0 || now - last > 5000000000LL) &&
+            g_spinStallLogs.load(std::memory_order_relaxed) < 20) {
+            g_lastStallLogNs.store(now, std::memory_order_relaxed);
+            g_spinStallLogs.fetch_add(1, std::memory_order_relaxed);
+            LOGI("PTHREAD_LOCK_STALL wait_ms=%{public}lld spins=%{public}d owner=%{public}d self=%{public}d",
+                 (long long)(waited / 1000000), spins, owner, g_threadTid);
+        }
+    }
 }
 
 /*
@@ -226,6 +341,12 @@ void UnlockTable()
 constexpr size_t kReclaimThreshold = 2048;
 constexpr size_t kReclaimBatch = 512;
 constexpr long long kReclaimGraceMs = 2000;
+/* A full sweep costs one pass over the whole table, so it is not something to do on every destroy:
+ * the engine destroys locks in bursts (hundreds a second while a scene loads), and each of those used
+ * to walk a few thousand nodes while holding the mapping lock every other thread needs. Four times a
+ * second, with batches big enough that a pass actually drains the graveyard, keeps the tables bounded
+ * and keeps the held time short. */
+constexpr long long kReclaimIntervalMs = 250;
 
 static long long ReclaimClockMs()
 {
@@ -256,13 +377,20 @@ void ReclaimDeadTables()
     if (g_mutexes.size() < kReclaimThreshold && g_conds.size() < kReclaimThreshold &&
         g_rwlocks.size() < kReclaimThreshold) return;
     const long long now = ReclaimClockMs();
-    size_t removed = ReclaimDeadLocked(g_mutexes, kReclaimBatch, now);
-    removed += ReclaimDeadLocked(g_conds, kReclaimBatch / 2, now);
-    removed += ReclaimDeadLocked(g_rwlocks, kReclaimBatch / 2, now);
-    if (removed) {
-        LOGI("SYNC_RECLAIM removed=%{public}zu mutex=%{public}zu cond=%{public}zu rw=%{public}zu",
-             removed, g_mutexes.size(), g_conds.size(), g_rwlocks.size());
-    }
+    static long long lastSweepMs = 0;
+    /* Twice a second at most: the sweep walks the whole table, and it runs with the lock held. */
+    if (now - lastSweepMs < kReclaimIntervalMs) return;
+    lastSweepMs = now;
+    /*
+     * Batch large enough that a pass actually drains what is dead: the tables sit around 4096 entries
+     * while a pass frees one or two, so a small batch means the graveyard never shrinks and every
+     * destroy pays for a scan anyway. Nothing is printed here: see the note above ReclaimNowNs - a
+     * blocking hilog write with the mapping lock held stops every pthread call in the process, audio
+     * included.
+     */
+    ReclaimDeadLocked(g_mutexes, kReclaimBatch * 8, now);
+    ReclaimDeadLocked(g_conds, kReclaimBatch * 4, now);
+    ReclaimDeadLocked(g_rwlocks, kReclaimBatch * 4, now);
 }
 
 pthread_mutex_t *MutexFor(void *foreign){

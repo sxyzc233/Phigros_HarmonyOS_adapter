@@ -8,7 +8,7 @@ terms. This is an independent community project, not an official release.
 No original game APK, engine binary, IL2CPP binary, metadata, chart, music,
 user save or signing material is distributed in this source repository.
 `tools/bootstrap-files.json` lists only paths. Compatibility offsets and
-fingerprints are specific to Android 4.1.0.
+fingerprints are specific to Android 4.1.0.1.
 
 The PNG application icons are supplied with the adapter project.
 Third-party artwork retains its applicable license.

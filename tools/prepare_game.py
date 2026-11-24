@@ -9,14 +9,14 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-APK_VERSION = '4.1.0'
+APK_VERSION = '4.1.0.1'
 FINGERPRINTS = {
     'lib/arm64-v8a/libunity.so': (20253848, 0x44322af8),
-    'lib/arm64-v8a/libil2cpp.so': (71736312, 0xdf3281f9),
+    'lib/arm64-v8a/libil2cpp.so': (71736312, 0xe2ddc6f0),
     'lib/arm64-v8a/libmain.so': (6728, 0x581468ea),
     'lib/arm64-v8a/libnativeaudioe7.so': (108544, 0xcdc4fc99),
-    'assets/bin/Data/Managed/Metadata/global-metadata.dat': (11288008, 0xa8094e98),
-    'assets/bin/Data/boot.config': (151, 0xeeb70f80),
+    'assets/bin/Data/Managed/Metadata/global-metadata.dat': (11288016, 0xdd7ac4f4),
+    'assets/bin/Data/boot.config': (151, 0x822e1f73),
 }
 
 def checked_archive(archive, bootstrap):

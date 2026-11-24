@@ -5,7 +5,7 @@ import { TapAuthFlow, TapAuthView } from '../probe/TapAuthFlow';
 import { TapLoginFlow } from '../probe/TapLoginFlow';
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 import { picker } from '@kit.CoreFileKit';
-import { originalApkReady, existingApkCompatible, importOriginalApk } from '../probe/OriginalApk';
+import { originalApkReady, existingApkCompatible, importOriginalApk, downloadOriginalApk } from '../probe/OriginalApk';
 import { APK_PROFILE_ID } from '../probe/ApkProfile';
 
 /*
@@ -301,6 +301,8 @@ struct ProbePage {
   @State sheetIsAuth: boolean = false;
   /* Until this timestamp the close transition still owns the flag; see requestSheet(). */
   private sheetClosingUntil: number = 0;
+  /* One-shot latch: the intercept permission is requested at most once per process. */
+  private interceptPermissionSettled: boolean = false;
   private pendingSheet: number = SHEET_PENDING_NONE;
   /* What the page currently wants on screen, and how many times an open has been re-issued. */
   private wantSheet: number = SHEET_PENDING_NONE;
@@ -312,18 +314,43 @@ struct ProbePage {
    * Heading strings for the current card. Kept as state so a re-render hands the sheet the same
    * values instead of a freshly built literal, which would also disturb a running transition.
    */
-  @State sheetTitle: string = 'Phigros Adapter 选项';
+  @State sheetTitle: string = 'Phigros 选项';
   @State sheetSubtitle: string = '快速进行 2 次返回操作可打开此页面';
 
   private isOptionsSheet(): boolean { return this.sheetVisible && !this.sheetIsAuth; }
   private isAuthSheet(): boolean { return this.sheetVisible && this.sheetIsAuth; }
-  @State inputInterceptWanted: boolean = false;
+  /*
+   * Exclusive touch starts on. The window path only ever hands the engine one consolidated state per
+   * frame - the frame's other touch points are not exposed to the app at all (GetHistoricalPoints
+   * comes back empty on this device) - so multi-finger fast taps lose presses. The interceptor reports
+   * every finger's down/move/up as its own event, which is what the game needs. The switch stays in
+   * the options sheet so it can be given back to the window path.
+   */
+  @State inputInterceptWanted: boolean = true;
   @State inputInterceptActive: boolean = false;
   @State inputInterceptNote: string = '';
   @State showFps: boolean = false;
   /* Result line shown to the right of the high-refresh button, so the outcome is visible next to it. */
   @State frameRateNote: string = '当前请求 120Hz';
   @State jniTrace: boolean = false;
+  /*
+   * Touch shaping switches. v11 turns the three that touch the reported position back OFF by default.
+   * A predicted position is a guess about where the finger will be: on a hold note that guess can sit
+   * outside the note while the real finger is still on it, which the engine reads as the hold breaking.
+   * Measured moves are the honest signal, so by default the engine now gets exactly what the panel
+   * reported. The switches stay here for a device that benefits from them.
+   */
+  @State optPredict: boolean = false;
+  @State optJitter: boolean = false;
+  /*
+   * The merge is a *frame* merge now: the moves already queued are folded into one MotionEvent carrying
+   * every pointer, which is exactly what a real device sends. It does not rewrite any coordinate, and it
+   * is the difference between one engine call per input frame and one per finger per frame.
+   */
+  @State optCoalesce: boolean = true;
+  @State optDupeRecover: boolean = true;
+  @State optToolFilter: boolean = true;
+  @State optHighRate: boolean = true;
   private restartInProgress: boolean = false;
   /* Serial of the last stalled frame we already reported, so one stall logs once, not every poll. */
   private stuckLoggedSerial: string = '';
@@ -351,6 +378,8 @@ struct ProbePage {
   @State importBusy: boolean = false;
   @State importStatus: string = '首次使用需要导入 Phigros ' + APK_PROFILE_ID + ' Android 原包';
   @State importFailed: boolean = false;
+  @State showApkLink: boolean = false;
+  @State apkLink: string = '';
 
   aboutToAppear(): void {
     /*
@@ -359,7 +388,12 @@ struct ProbePage {
      * switch in 调试 is the only way in.
      */
     if (TRACE_ON_START) probe.setJniTrace(true);
+    /* Build identity, ArkTS half: printed by the .abc, so a log line here proves the bundle itself was
+     * replaced - which the native half alone cannot distinguish. */
+    hilog.info(0x0000, 'TransProbe', 'TOUCH_BUILD_ETS v12');
     this.jniTrace = TRACE_ON_START;
+    this.applyTouchOptions();
+    if (this.optHighRate) this.requestHighFrameRate();
     this.keyboardTimer = setInterval(() => this.pollKeyboard(), 32);
     this.resourcesReady = originalApkReady();
     if (!this.resourcesReady) {
@@ -411,13 +445,39 @@ struct ProbePage {
       const files: string[] = await documents.select({ maxSelectNumber: 1, fileSuffixFilters: ['Android 原包|.apk'] });
       if (files.length === 0) return;
       await importOriginalApk(files[0], (message: string) => { this.importStatus = message; });
-      this.assetsPrepared = false;
-      this.resourcesReady = true;
-      this.startUnity();
+      this.finishApkImport();
     } catch (error) {
       this.importFailed = true;
       this.importStatus = error instanceof Error ? error.message : '未能导入资源，请检查文件和剩余存储空间后重试。';
     } finally { this.importBusy = false; }
+  }
+
+  private finishApkImport(): void {
+    this.assetsPrepared = false;
+    this.resourcesReady = true;
+    this.startUnity();
+  }
+
+  private async downloadApk(): Promise<void> {
+    if (this.importBusy) return;
+    this.importBusy = true;
+    this.importFailed = false;
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      await downloadOriginalApk(context, this.apkLink, (message: string) => { this.importStatus = message; });
+      this.apkLink = '';
+      this.finishApkImport();
+    } catch (error) {
+      this.importFailed = true;
+      this.importStatus = error instanceof Error ? error.message : '下载未完成，请检查 HTTPS 直链后重试。';
+    } finally { this.importBusy = false; }
+  }
+
+  private openTapTapDownload(): void {
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    context.openLink('https://www.taptap.cn/app/165287').catch(() => {
+      this.importStatus = '无法打开 TapTap，请在 TapTap 搜索 Phigros。';
+    });
   }
 
   private openAuthorization(): void {
@@ -521,9 +581,29 @@ struct ProbePage {
     if (probe.nativeTouchAvailable()) return;
     const action: number = event.type === TouchType.Down ? 0 : event.type === TouchType.Up ? 1 :
       event.type === TouchType.Cancel ? 3 : 2;
-    for (const point of event.changedTouches) {
-      probe.touch(action, point.id, this.getUIContext().vp2px(point.x), this.getUIContext().vp2px(point.y), event.timestamp);
+    /*
+     * ArkUI runs onTouch at most once per frame and reports only the frame's last touch event; the
+     * others become historical points. changedTouches alone therefore cannot describe a frame in which
+     * two fingers changed, so the whole pressed set (touches) is sent and the native layer reconciles
+     * it against what the engine holds. Native coordinates are component-local pixels, hence vp2px.
+     */
+    const changed: TouchObject[] = event.changedTouches;
+    const changedId: number = changed.length > 0 ? changed[0].id : -1;
+    let changedX: number = 0;
+    let changedY: number = 0;
+    if (changed.length > 0) {
+      changedX = this.getUIContext().vp2px(changed[0].x);
+      changedY = this.getUIContext().vp2px(changed[0].y);
     }
+    const ids: number[] = [];
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const point of event.touches) {
+      ids.push(point.id);
+      xs.push(this.getUIContext().vp2px(point.x));
+      ys.push(this.getUIContext().vp2px(point.y));
+    }
+    probe.touchSnapshot(action, changedId, changedX, changedY, ids, xs, ys, event.timestamp);
   }
 
   /*
@@ -556,7 +636,7 @@ struct ProbePage {
       this.sheetTitle = this.sdkTitle;
       this.sheetSubtitle = '';
     } else {
-      this.sheetTitle = 'Phigros Adapter 选项';
+      this.sheetTitle = 'Phigros 选项';
       this.sheetSubtitle = '快速进行 2 次返回操作可打开此页面';
     }
     hilog.info(0x0000, 'TransProbe', 'SHEET open kind=%{public}s attempt=%{public}d',
@@ -691,9 +771,20 @@ struct ProbePage {
       return;
     }
 
+    /*
+     * INTERCEPT_INPUT_EVENT is a user grant. Ask for it the first time the game screen wants the
+     * interceptor, then never again: a denial turns the switch off inside toggleInputIntercept, so
+     * this cannot turn into a permission prompt loop.
+     */
+    if (!this.interceptPermissionSettled) {
+      this.interceptPermissionSettled = true;
+      this.toggleInputIntercept(true);
+      return;
+    }
+
     const state = probe.startInputIntercept() as InputInterceptResult;
     this.inputInterceptActive = state.ok;
-      '启动失败，返回码 ' + state.result.toString();
+    if (!state.ok) this.inputInterceptNote = '启动失败，返回码 ' + state.result.toString();
     hilog.info(0x0000, 'TransInput', 'INTERCEPT_START ok=%{public}d result=%{public}d',
       state.ok ? 1 : 0, state.result);
   }
@@ -704,6 +795,19 @@ struct ProbePage {
    * platform refusing it - in which case the previous rate stays and the note says so instead of
    * pretending the switch worked.
    */
+  /*
+   * Pushes the native touch switches. Called once at startup and on every toggle, so the sheet and the
+   * engine's actual behaviour cannot drift apart. Each switch is read per event natively, so a change
+   * applies to the next touch rather than the next launch.
+   */
+  private applyTouchOptions(): void {
+    probe.setTouchOption('predict', this.optPredict);
+    probe.setTouchOption('jitter', this.optJitter);
+    probe.setTouchOption('coalesce', this.optCoalesce);
+    probe.setTouchOption('dupeRecover', this.optDupeRecover);
+    probe.setTouchOption('toolFilter', this.optToolFilter);
+  }
+
   private requestHighFrameRate(): void {
     let result: number = -1;
     try {
@@ -810,8 +914,11 @@ struct ProbePage {
    */
   @Builder
   OptionsSheetContent() {
-    Column({ space: 10 }) {
-      Text('触控').fontSize(13).fontColor('#7C8798').width('100%')
+    /* The panel is a full-height side sheet, so the list owns the whole body height and scrolls
+     * inside it: every option keeps its one-line explanation and nothing is clipped. */
+    Scroll() {
+      Column({ space: 10 }) {
+        Text('触控').fontSize(13).fontColor('#7C8798').width('100%')
 
       Row() {
         Column({ space: 4 }) {
@@ -831,6 +938,101 @@ struct ProbePage {
       if (this.inputInterceptNote.length > 0) {
         Text(this.inputInterceptNote).fontSize(12).fontColor('#A9B2C0').width('100%')
       }
+
+      Text('触控优化').fontSize(13).fontColor('#7C8798').width('100%').margin({ top: 8 })
+
+      Row() {
+        Column({ space: 4 }) {
+          Text('触摸预测补偿').fontSize(16).fontColor('#E5EAF1')
+          Text('按手指最近的速度把落点推算到下一帧，最多补 6 px。v11 起默认关闭：推算会把落点推到手指前面，长条上容易判成脱手。')
+            .fontSize(12).fontColor('#A9B2C0')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.optPredict })
+          .onChange((isOn: boolean) => { this.optPredict = isOn; this.applyTouchOptions(); })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column({ space: 4 }) {
+          Text('抖动抑制').fontSize(16).fontColor('#E5EAF1')
+          Text('手指按住不动时面板仍会报亚像素漂移，小于约 1.2 px 的移动直接丢掉。v11 起默认关闭：慢滑时会把“在动”变成“没动”。')
+            .fontSize(12).fontColor('#A9B2C0')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.optJitter })
+          .onChange((isOn: boolean) => { this.optJitter = isOn; this.applyTouchOptions(); })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column({ space: 4 }) {
+          Text('移动事件合并').fontSize(16).fontColor('#E5EAF1')
+          Text('把同一批到达的各指移动合成一条事件，所有指针位置一次送进去（真机就是这么做的）。不改坐标，只是把每帧十次引擎调用变成一次。')
+            .fontSize(12).fontColor('#A9B2C0')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.optCoalesce })
+          .onChange((isOn: boolean) => { this.optCoalesce = isOn; this.applyTouchOptions(); })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column({ space: 4 }) {
+          Text('非手指输入过滤').fontSize(16).fontColor('#E5EAF1')
+          Text('笔、手掌、指关节这类工具的触点不进引擎，避免留下按住不放的幽灵触点。')
+            .fontSize(12).fontColor('#A9B2C0')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.optToolFilter })
+          .onChange((isOn: boolean) => { this.optToolFilter = isOn; this.applyTouchOptions(); })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column({ space: 4 }) {
+          Text('同 id 抢占自愈').fontSize(16).fontColor('#E5EAF1')
+          Text('抬指事件丢失、同一个 id 被新手指复用时，先补一次抬起注入，再把新手指定为按下。')
+            .fontSize(12).fontColor('#A9B2C0')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.optDupeRecover })
+          .onChange((isOn: boolean) => { this.optDupeRecover = isOn; this.applyTouchOptions(); })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+
+      Row() {
+        Column({ space: 4 }) {
+          Text('自动申请 144Hz').fontSize(16).fontColor('#E5EAF1')
+          Text('每次进入游戏自动向合成器申请最高刷新率；面板不支持时由系统钳制回上限。')
+            .fontSize(12).fontColor('#A9B2C0')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.optHighRate })
+          .onChange((isOn: boolean) => {
+            this.optHighRate = isOn;
+            if (isOn) this.requestHighFrameRate();
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
 
       Text('显示').fontSize(13).fontColor('#7C8798').width('100%').margin({ top: 8 })
 
@@ -870,9 +1072,14 @@ struct ProbePage {
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 4, bottom: 24 })
     }
     .width('100%')
-    .padding({ left: 24, right: 24, bottom: 24 })
+    .height('100%')
+    .scrollBar(BarState.Auto)
+    .edgeEffect(EdgeEffect.Spring)
   }
 
   build() {
@@ -953,16 +1160,26 @@ struct ProbePage {
       }
       if (!this.resourcesReady) {
         Column({ space: 18 }) {
-          Text('欢迎使用 Phigros Adapter')
+          Text('欢迎使用 Phigros')
             .fontSize(28).fontColor(Color.White).fontWeight(FontWeight.Bold)
           if (this.importFailed) { Text('导入未完成').fontColor('#FFB5B5').fontSize(18) }
           Text(this.importStatus).fontSize(16).fontColor(this.importFailed ? '#FFB5B5' : '#DEE5EE').textAlign(TextAlign.Center)
           if (this.importBusy) {
             LoadingProgress().width(36).height(36).color(Color.White)
           } else {
-            Button('选择 Android 原包').onClick(() => { this.chooseOriginalApk(); })
+            Row({ space: 8 }) {
+              Button('选择 Android 原包').onClick(() => { this.chooseOriginalApk(); })
+              Button('打开 TapTap').onClick(() => { this.openTapTapDownload(); })
+              Button('使用直链').onClick(() => { this.showApkLink = !this.showApkLink; })
+            }
+            if (this.showApkLink) {
+              TextInput({ placeholder: '粘贴 APK HTTPS 直链', text: this.apkLink })
+                .maxLength(8192).onChange((value: string) => { this.apkLink = value; }).width('100%')
+              Button('下载并导入（约 2.48 GB）').enabled(this.apkLink.trim().length > 0)
+                .onClick(() => { this.downloadApk(); })
+            }
           }
-          Text('游戏中快速进行 2 次返回操作可以 Phigros Adapter 打开应用选项窗口')
+          Text('游戏中快速按两次返回即可打开应用选项')
             .fontSize(14).fontColor('#A9B2C0').textAlign(TextAlign.Center)
         }.padding(28).width('78%').constraintSize({ maxWidth: 700 })
       }
@@ -989,10 +1206,16 @@ struct ProbePage {
      * one closes as soon as anything re-renders. The title follows whichever card is showing.
      */
     .bindSheet($$this.sheetVisible, this.ActiveSheetContent(), {
-      preferType: SheetType.CENTER,
+      /*
+       * Side sheet: the card docks to the right edge of the window at full height instead of sitting
+       * in the middle, so the game stays visible on the left while the player reads the options. A
+       * side sheet only supports the full-screen height, which is exactly what the list wants.
+       */
+      preferType: SheetType.SIDE,
       showClose: true,
       dragBar: false,
-      height: SheetSize.FIT_CONTENT,
+      height: SheetSize.LARGE,
+      width: '44%',
       title: { title: this.sheetTitle, subtitle: this.sheetSubtitle }
       /*
        * No shouldDismiss / onWillDismiss on purpose. Those hooks hand the dismissal to the page at the

@@ -1,9 +1,9 @@
 {
   "app": {
-    "bundleName": "com.rea.message.demo",
+    "bundleName": "com.pgrhmos.transcode.demo",
     "vendor": "REA Coursework",
-    "versionCode": 161,
-    "versionName": "4.1.0",
+    "versionCode": 162,
+    "versionName": "4.1.0.1",
     "icon": "$media:app_icon",
     "label": "$string:app_name",
     "distributedNotificationEnabled": true,

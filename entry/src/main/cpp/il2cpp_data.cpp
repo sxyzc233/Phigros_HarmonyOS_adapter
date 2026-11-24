@@ -33,7 +33,7 @@ namespace {
 /*
  * Keep metadata version-specific so a new engine never reuses the previous APK metadata.
  */
-const char *kPreparedDir = "/data/storage/el2/base/files/rea/4.1.0-apk-v1";
+const char *kPreparedDir = "/data/storage/el2/base/files/rea/4.1.0.1-apk-v1";
 const char *kMetadataAsset = "bin/Data/Managed/Metadata/global-metadata.dat";
 const char *kMetadataName = "global-metadata.dat";
 

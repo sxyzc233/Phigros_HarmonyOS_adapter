@@ -13,8 +13,11 @@
 #include <hilog/log.h>
 
 #include <cstdint>
+#include <set>
 
 extern "C" void ReaQueueTouch(int action, int id, double x, double y, double sourceTimestamp);
+/* Live option lookup from jni_emu.cpp; the tool filter can be switched off from the options sheet. */
+extern "C" bool ReaTouchOption(const char *name);
 
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -49,6 +52,14 @@ Input_InterceptorEventCallback g_callbacks{};
 bool g_installed = false;
 int g_result = -1;
 uint64_t g_events = 0;
+/* Tool-type census. A knuckle or a palm arrives as its own tool type on some devices; a stylus class
+ * tool never belongs to a rhythm-game finger, so those are counted and kept out of the pointer set. */
+uint64_t g_toolFinger = 0;
+uint64_t g_toolOther = 0;
+int g_toolLogs = 0;
+/* Press/lift tracing: capped, so a fast multi-finger landing is fully visible in the log. */
+int g_pressLogs = 0;
+int64_t g_lastDownMicros = 0;
 
 void OnTouch(const Input_TouchEvent *event)
 {
@@ -62,11 +73,56 @@ void OnTouch(const Input_TouchEvent *event)
     const int32_t y = OH_Input_GetTouchEventWindowY(event);
     /* Action time arrives in microseconds; the queue and the engine both work in nanoseconds. */
     const int64_t micros = OH_Input_GetTouchEventActionTime(event);
+    const int tool = (int)OH_Input_GetTouchEventToolType(event);
+
+    if (tool == (int)TOOL_TYPE_FINGER || !ReaTouchOption("toolFilter")) {
+        if (tool == (int)TOOL_TYPE_FINGER) ++g_toolFinger;
+    } else {
+        /*
+         * Not a finger. Dropping these is safe for the engine's pointer set: without their Down the
+         * later Move/Up are ignored, so a stray pen or palm can never leave a pointer held down.
+         */
+        ++g_toolOther;
+        if (++g_toolLogs <= 8) {
+            LOGI("INTERCEPT_TOOL_DROP tool=%{public}d action=%{public}d id=%{public}d x=%{public}d y=%{public}d",
+                 tool, action, id, x, y);
+        }
+        return;
+    }
 
     ReaQueueTouch(action, id, (double)x, (double)y, (double)(micros * 1000));
 
     if (++g_events <= 20) {
         LOGI("INTERCEPT_TOUCH action=%{public}d id=%{public}d x=%{public}d y=%{public}d", action, id, x, y);
+    }
+    /*
+     * Down/lift detail. `gap` is the distance to the previous down in microseconds: a chord where several
+     * fingers land nearly together is exactly what this trace is for, and it also reveals whether the
+     * platform hands out the same finger id twice inside that window.
+     */
+    /*
+     * Chord tracing only. A budget of a few hundred lines spent on ordinary notes explains nothing; the
+     * case under investigation is several fingers landing inside the same few milliseconds, so only
+     * presses that follow the previous press closely are recorded - together with the lift of any finger
+     * that arrived in such a burst, which shows whether the engine ever saw it let go.
+     */
+    static std::set<int> g_chordIds;
+    if ((action == 0 || action == 1) && g_pressLogs < 300) {
+        const int64_t gap = (action == 0 && g_lastDownMicros > 0) ? micros - g_lastDownMicros : -1;
+        if (action == 0) g_lastDownMicros = micros;
+        const bool chord = (action == 0 && gap >= 0 && gap < 20000) || (action == 1 && g_chordIds.count(id));
+        if (chord) {
+            if (action == 0) g_chordIds.insert(id);
+            if (action == 1) g_chordIds.erase(id);
+            const int32_t pressure = (int32_t)(OH_Input_GetTouchEventPressure(event) * 1000);
+            LOGI("INTERCEPT_PRESS action=%{public}d id=%{public}d x=%{public}d y=%{public}d gap_us=%{public}lld pressure=%{public}d",
+                 action, id, x, y, (long long)gap, pressure);
+            ++g_pressLogs;
+        }
+    }
+    if (g_events % 3000 == 0) {
+        LOGI("INTERCEPT_TOOLS finger=%{public}llu other=%{public}llu",
+             (unsigned long long)g_toolFinger, (unsigned long long)g_toolOther);
     }
 }
 
@@ -89,6 +145,12 @@ extern "C" bool ReaInputInterceptStart(int *outResult)
     g_result = (int)result;
     g_installed = result == INPUT_SUCCESS;
     LOGI("OH_Input_AddInputEventInterceptor result=%{public}d", g_result);
+    /*
+     * From this moment the window stops receiving touches entirely, so any pointer the XComponent path
+     * still holds from the last frame would stay pressed for good - a phantom that makes the final real
+     * lift arrive as POINTER_UP instead of UP. Clear the engine's set and start the interceptor clean.
+     */
+    if (g_installed) ReaQueueTouch(3, 0, 0, 0, 0);
     if (outResult) *outResult = g_result;
     return g_installed;
 }

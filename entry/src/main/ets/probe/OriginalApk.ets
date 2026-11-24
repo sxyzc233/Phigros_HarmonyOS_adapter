@@ -1,6 +1,9 @@
 import { fileIo, hash, statfs } from '@kit.CoreFileKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { APK_PROFILE_ID } from './ApkProfile';
+import { common } from '@kit.AbilityKit';
+import { request } from '@kit.BasicServicesKit';
+import { url } from '@kit.ArkTS';
+import { APK_DOWNLOAD_BYTES, APK_DOWNLOAD_SHA256, APK_PROFILE_ID } from './ApkProfile';
 import { checkApkArchive } from './ApkArchive';
 
 export const ORIGINAL_APK_PATH: string = '/data/storage/el2/base/files/rea-original-phigros.apk';
@@ -76,6 +79,100 @@ export async function existingApkCompatible(): Promise<boolean> {
   finally { if (!files.delayedCleanup) await files.cleanup(); }
 }
 
+async function saveVerifiedApk(temporary: string, marker: ImportedApk): Promise<void> {
+  const markerTemp: string = temporary + '.json';
+  const record = await fileIo.open(markerTemp, fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC | fileIo.OpenMode.WRITE_ONLY);
+  try { await fileIo.write(record.fd, JSON.stringify(marker)); await fileIo.fsync(record.fd); }
+  finally { await fileIo.close(record); }
+
+  let backup: string = '';
+  if (await fileIo.access(ORIGINAL_APK_PATH)) {
+    backup = ORIGINAL_APK_PATH + '.previous.' + Date.now().toString();
+    await fileIo.rename(ORIGINAL_APK_PATH, backup);
+  }
+  let installed: boolean = false;
+  try {
+    await fileIo.rename(temporary, ORIGINAL_APK_PATH);
+    installed = true;
+    await fileIo.rename(markerTemp, MARKER_PATH);
+  } catch (error) {
+    if (installed) await fileIo.rename(ORIGINAL_APK_PATH, temporary);
+    if (backup.length > 0) await fileIo.rename(backup, ORIGINAL_APK_PATH);
+    throw error as Error;
+  }
+}
+
+export async function downloadOriginalApk(context: common.UIAbilityContext, address: string,
+  onStatus: (message: string) => void): Promise<void> {
+  const link: url.URL = url.URL.parseURL(address.trim());
+  if (link.protocol !== 'https:' || link.username.length > 0 || link.password.length > 0) {
+    throw new Error('请输入 HTTPS APK 直链。');
+  }
+  const files = new ImportFiles();
+  const temporary: string = ORIGINAL_APK_PATH + '.download';
+  files.temporary = temporary;
+  try {
+    await fileIo.unlink(temporary).catch(() => {});
+    const free: number = await statfs.getFreeSize(context.filesDir);
+    if (free < APK_DOWNLOAD_BYTES + 500 * 1024 * 1024) {
+      throw new Error('请预留约 3 GB 空间用于下载和准备游戏资源。');
+    }
+    onStatus('正在连接下载地址……');
+    const options: request.agent.Config = {
+      action: request.agent.Action.DOWNLOAD,
+      url: link.toString(),
+      mode: request.agent.Mode.FOREGROUND,
+      title: 'Phigros ' + APK_PROFILE_ID,
+      saveas: 'file://' + context.abilityInfo.bundleName + temporary,
+      overwrite: false
+    };
+    const task: request.agent.Task = await request.agent.create(context, options);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        task.on('progress', (progress: request.agent.Progress) => {
+          const total: number = progress.sizes.length > 0 ? progress.sizes[0] : -1;
+          if ((total > 0 && total !== APK_DOWNLOAD_BYTES) || progress.processed > APK_DOWNLOAD_BYTES) {
+            reject(new Error('下载内容的大小与当前版本原包不符。'));
+            return;
+          }
+          onStatus('正在下载 ' + Math.floor(100 * progress.processed / APK_DOWNLOAD_BYTES).toString() + '%');
+        });
+        task.on('completed', () => { resolve(); });
+        task.on('failed', () => { reject(new Error('APK 下载失败，请检查网络和直链。')); });
+        task.on('pause', () => { reject(new Error('下载已暂停，请在网络恢复后重试。')); });
+        task.on('remove', () => { reject(new Error('下载已结束，请重试。')); });
+        task.start().catch(() => { reject(new Error('无法开始下载，请检查直链或剩余空间。')); });
+      });
+
+      onStatus('正在校验下载的 APK……');
+      files.source = await fileIo.open(temporary, fileIo.OpenMode.READ_ONLY);
+      const info = await fileIo.stat(files.source.fd);
+      if (info.size !== APK_DOWNLOAD_BYTES) throw new Error('下载的 APK 不完整或版本不匹配。');
+      await checkApkArchive(files.source.fd, info.size, (offset: number, length: number) => files.readAt(offset, length));
+      fileIo.lseek(files.source.fd, 0, fileIo.WhenceType.SEEK_SET);
+      const digest = hash.createHash('sha256');
+      const buffer = new ArrayBuffer(CHUNK_SIZE);
+      let remaining: number = info.size;
+      while (remaining > 0) {
+        const count: number = await files.wait(fileIo.read(files.source.fd, buffer,
+          { length: Math.min(CHUNK_SIZE, remaining) }), '校验资源');
+        if (count <= 0) throw new Error('下载的 APK 读取不完整。');
+        digest.update(count === buffer.byteLength ? buffer : buffer.slice(0, count));
+        remaining -= count;
+      }
+      await fileIo.close(files.source);
+      files.source = undefined;
+      const sha256: string = digest.digest().toLowerCase();
+      if (sha256 !== APK_DOWNLOAD_SHA256) throw new Error('APK 的 SHA-256 与当前版本原包不匹配。');
+      await saveVerifiedApk(temporary, { profile: APK_PROFILE_ID, bytes: info.size, sha256: sha256 });
+    } finally {
+      await request.agent.remove(task.tid).catch(() => {});
+    }
+  } finally {
+    if (!files.delayedCleanup) await files.cleanup();
+  }
+}
+
 export async function importOriginalApk(uri: string, onStatus: (message: string) => void): Promise<void> {
   const files = new ImportFiles();
   files.temporary = ORIGINAL_APK_PATH + '.importing.' + Date.now().toString() + '.' + (++importSerial).toString();
@@ -131,19 +228,7 @@ export async function importOriginalApk(uri: string, onStatus: (message: string)
     await fileIo.close(files.destination); files.destination = undefined;
     await fileIo.close(files.source); files.source = undefined;
     const marker: ImportedApk = { profile: APK_PROFILE_ID, bytes: info.size, sha256: digest.digest() };
-    const markerTemp: string = files.temporary + '.json';
-    const record = await fileIo.open(markerTemp, fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC | fileIo.OpenMode.WRITE_ONLY);
-    try { await fileIo.write(record.fd, JSON.stringify(marker)); await fileIo.fsync(record.fd); }
-    finally { await fileIo.close(record); }
-    // Keep pre-existing resources. Account/preferences files are never touched.
-    let backup: string = '';
-    if (await fileIo.access(ORIGINAL_APK_PATH)) {
-      backup = ORIGINAL_APK_PATH + '.previous.' + Date.now().toString();
-      await fileIo.rename(ORIGINAL_APK_PATH, backup);
-    }
-    try { await fileIo.rename(files.temporary, ORIGINAL_APK_PATH); }
-    catch (error) { if (backup.length > 0) await fileIo.rename(backup, ORIGINAL_APK_PATH); throw error as Error; }
-    await fileIo.rename(markerTemp, MARKER_PATH);
+    await saveVerifiedApk(files.temporary, marker);
     hilog.info(0, 'TransImport', 'IMPORT_DONE profile=%{public}s bytes=%{public}d time_ms=%{public}d', APK_PROFILE_ID, info.size, Date.now() - began);
   } catch (error) {
     hilog.error(0, 'TransImport', 'IMPORT_FAILED phase=%{public}s', phase);
