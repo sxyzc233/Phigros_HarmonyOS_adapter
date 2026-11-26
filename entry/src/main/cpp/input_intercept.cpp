@@ -18,6 +18,7 @@
 extern "C" void ReaQueueTouch(int action, int id, double x, double y, double sourceTimestamp);
 /* Live option lookup from jni_emu.cpp; the tool filter can be switched off from the options sheet. */
 extern "C" bool ReaTouchOption(const char *name);
+extern "C" bool ReaJniTraceState();
 
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -92,7 +93,9 @@ void OnTouch(const Input_TouchEvent *event)
 
     ReaQueueTouch(action, id, (double)x, (double)y, (double)(micros * 1000));
 
-    if (++g_events <= 20) {
+    ++g_events;
+    const bool traceTouch = ReaJniTraceState();
+    if (traceTouch && g_events <= 20) {
         LOGI("INTERCEPT_TOUCH action=%{public}d id=%{public}d x=%{public}d y=%{public}d", action, id, x, y);
     }
     /*
@@ -107,7 +110,7 @@ void OnTouch(const Input_TouchEvent *event)
      * that arrived in such a burst, which shows whether the engine ever saw it let go.
      */
     static std::set<int> g_chordIds;
-    if ((action == 0 || action == 1) && g_pressLogs < 300) {
+    if (traceTouch && (action == 0 || action == 1) && g_pressLogs < 300) {
         const int64_t gap = (action == 0 && g_lastDownMicros > 0) ? micros - g_lastDownMicros : -1;
         if (action == 0) g_lastDownMicros = micros;
         const bool chord = (action == 0 && gap >= 0 && gap < 20000) || (action == 1 && g_chordIds.count(id));

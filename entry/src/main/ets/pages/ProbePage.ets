@@ -974,7 +974,7 @@ struct ProbePage {
       Row() {
         Column({ space: 4 }) {
           Text('移动事件合并').fontSize(16).fontColor('#E5EAF1')
-          Text('把同一批到达的各指移动合成一条事件，所有指针位置一次送进去（真机就是这么做的）。不改坐标，只是把每帧十次引擎调用变成一次。')
+          Text('在 4 ms 内合并各指的移动，使用每根手指的最新坐标。落指和抬指仍按原顺序发送。')
             .fontSize(12).fontColor('#A9B2C0')
         }
         .alignItems(HorizontalAlign.Start)

@@ -1044,10 +1044,12 @@ void *DispatchObjectCall(FakeObject *obj, MethodRef *m, void *arg0, void *arg1,v
          * one pointer-count read. A chord member that reads less - or nothing - was ignored inside the
          * engine, which is the difference between "we lost it" and "it refused it".
          */
-        if (name == "getAction" || name == "getActionMasked") obj->ints["probeAct"]++;
-        if (name == "getPointerCount") obj->ints["probePc"]++;
-        if (name == "getPointerId" || name == "findPointerIndex") obj->ints["probeId"]++;
-        if (name == "getX" || name == "getRawX") obj->ints["probeX"]++;
+        if (ReaJniTraceState()) {
+            if (name == "getAction" || name == "getActionMasked") obj->ints["probeAct"]++;
+            if (name == "getPointerCount") obj->ints["probePc"]++;
+            if (name == "getPointerId" || name == "findPointerIndex") obj->ints["probeId"]++;
+            if (name == "getX" || name == "getRawX") obj->ints["probeX"]++;
+        }
         if (name == "getSource") return (void *)(intptr_t)0x1002;
         if (name == "getPointerCount") return (void *)(intptr_t)obj->touchPoints.size();
         if (name == "getAction" || name == "getActionMasked" || name == "getActionIndex") {
@@ -2086,7 +2088,7 @@ static double FloatingResult(FakeObject *object,MethodRef *method,void *index)
         if (name=="getRawX" || name=="getRawY")point=0;
         if (name=="getX" || name=="getRawX" || name=="getY" || name=="getRawY") {
             /* Counted here as well as in the other dispatch: this is the path Unity's float reads take. */
-            object->ints["probeX"]++;
+            if (ReaJniTraceState()) object->ints["probeX"]++;
             return point<object->touchPoints.size() ? ((name=="getX" || name=="getRawX")?object->touchPoints[point].x:object->touchPoints[point].y) : 0;
         }
         if (name=="getPressure" || name=="getSize" || name=="getXPrecision" || name=="getYPrecision")return 1;
@@ -3749,22 +3751,6 @@ extern "C" bool ReaTouchOption(const char *name)
  * the render loop (FRAME_HITCH), which attributes a dropped frame instead of describing touch.
  */
 /*
- * Records a pointer's position without injecting anything.
- *
- * The coalescing below may skip an injection, but it must never skip the state: every injected event
- * is built from g_activeTouches, so a skipped update left that finger at an older position in all
- * following snapshots. Combined with a gate that only one finger can win per window, that is what made
- * some pointers lag far behind their neighbours.
- */
-static void RecordTouchState(const TouchInput &input)
-{
-    std::lock_guard<std::mutex> lock(g_touchStateMutex);
-    if(!g_inputReady.load(std::memory_order_acquire))return;
-    if(input.action!=0 && input.action!=3 && g_activeTouches.count(input.id)==0)return;
-    g_activeTouches[input.id]={input.id,input.x,input.y};
-}
-
-/*
  * Injection core; the caller holds g_touchStateMutex.
  *
  * Every event is rebuilt from g_activeTouches, so it describes the whole finger set at once - the
@@ -3867,18 +3853,19 @@ static bool SubmitTouchLocked(const TouchInput &input,bool cancelForPause,bool *
     if(action==0 && g_activeTouches.size()>1)action=5|(changed<<8);
     if(action==1 && g_activeTouches.size()>1)action=6|(changed<<8);
     event->ints["action"]=action;event->ints["getEventTime"]=time;event->ints["getDownTime"]=g_touchDownTime;
+    const int64_t injectStart = MonotonicNs();
     unsigned char accepted=((unsigned char (*)(void *,void *,void *,int))g_inputInject)(&g_env,g_inputPlayer,event,0);
-    int64_t done=MonotonicNs();
+    const int64_t done = MonotonicNs();
     /*
      * Every non-move injection inside a burst is logged, with what the engine actually read out of it
      * (action / pointer count / pointer id / coordinates). Between the two ends of this path - what the
      * platform delivered and what the engine asked about - a missing press has nowhere left to hide.
      */
     static int64_t g_lastPressNs=0;
-    const int64_t pressNow=MonotonicNs();
-    const bool burst=g_lastPressNs>0&&(pressNow-g_lastPressNs)<20000000LL;
-    if(action!=2)g_lastPressNs=pressNow;
-    if(action!=2 && g_pressInjectLogs<300 && (burst || g_activeTouches.size()>=3)){
+    const bool tracePress = action != 2 && ReaJniTraceState();
+    const bool burst = g_lastPressNs > 0 && done - g_lastPressNs < 20000000LL;
+    if (tracePress) g_lastPressNs = done;
+    if (tracePress && g_pressInjectLogs < 300 && (burst || g_activeTouches.size() >= 3)) {
         ++g_pressInjectLogs;
         std::string list;
         for(const auto &point:g_activeTouches){
@@ -3891,7 +3878,7 @@ static bool SubmitTouchLocked(const TouchInput &input,bool cancelForPause,bool *
     }
     if(input.action==1)g_activeTouches.erase(input.id);
     if(input.action==3)g_activeTouches.clear();
-    const int64_t duration=done-input.entryNs;
+    const int64_t duration = done - injectStart;
     /*
      * A long injection is the one part of the path that used to stall the caller; now it only delays
      * the queue behind it. Keep the worst offenders visible so a remaining hiccup can be attributed.
@@ -3900,17 +3887,17 @@ static bool SubmitTouchLocked(const TouchInput &input,bool cancelForPause,bool *
         static int stallLogs=0;
         if(stallLogs<6){
             ++stallLogs;
-            Emit("INJECT_STALL ms=%.3f action=%d changedId=%d held=%d",
-                 duration/1e6,input.action,input.id,(int)g_activeTouches.size());
+            Emit("INJECT_STALL ms=%.3f before_inject_ms=%.3f action=%d changedId=%d held=%d",
+                 duration/1e6,(injectStart-input.entryNs)/1e6,input.action,input.id,(int)g_activeTouches.size());
         }
     }
     return accepted!=0;
 }
 
-static void SubmitTouch(const TouchInput &input,bool cancelForPause=false,bool *injectedOut=nullptr)
+static void SubmitTouch(const TouchInput &input,bool cancelForPause=false)
 {
     std::lock_guard<std::mutex> lock(g_touchStateMutex);
-    SubmitTouchLocked(input,cancelForPause,injectedOut);
+    SubmitTouchLocked(input,cancelForPause);
 }
 static void QueueUnityJob(FakeObject *job,bool inlineOnOwner)
 {
@@ -3929,27 +3916,23 @@ extern "C" void ReaLogUnityJobs(){
     std::lock_guard<std::mutex> lock(g_unityJobsMutex);
     Emit("UNITY_JOB_STATE pending=%zu",g_unityJobs.size());
 }
-/*
- * One MOVE per drained batch.
- *
- * The exclusive-touch interceptor reports one event per finger, so injecting each of them separately
- * means up to ten MotionEvents per input frame - every one of them allocates engine-side objects and
- * enters the engine, which is also the fastest way to make the managed heap collect. A real Android
- * device does the opposite: exactly one MotionEvent per input frame, carrying every pointer at its
- * current position. This does the same: every queued move is written into the held set first, then a
- * single MOVE is injected whose changed pointer is the one that triggered the batch. Positions are
- * never skipped and nothing is extrapolated.
- */
-static void ApplyMoveBatch(std::map<int,TouchPoint> &latest,const TouchInput &changed,bool *injectedOut)
+/* Apply the latest sample for each held pointer and timestamp the MOVE with the newest one. */
+static bool ApplyMoveBatch(const TouchInput *moves, size_t count)
 {
     std::lock_guard<std::mutex> lock(g_touchStateMutex);
-    for(const auto &point:latest){
-        auto held=g_activeTouches.find(point.first);
-        if(held==g_activeTouches.end())continue;
-        held->second.x=point.second.x;
-        held->second.y=point.second.y;
+    if (!g_inputReady.load(std::memory_order_acquire)) return false;
+    const TouchInput *changed = nullptr;
+    for (size_t i = 0; i < count; ++i) {
+        const TouchInput &move = moves[i];
+        auto held = g_activeTouches.find(move.id);
+        if (held == g_activeTouches.end()) continue;
+        held->second.x = move.x;
+        held->second.y = move.y;
+        if (!changed || move.entryNs >= changed->entryNs) changed = &move;
     }
-    SubmitTouchLocked(changed,false,injectedOut);
+    bool injected = false;
+    if (changed) SubmitTouchLocked(*changed, false, &injected);
+    return injected;
 }
 struct UnityHostStart {
     FakeObject *player;
@@ -4100,7 +4083,7 @@ static void *UnityHostBody(void *raw)
          * dozen hilog lines - on the render thread, once every ten to twenty seconds of play: a
          * guaranteed dropped frame at a regular interval. It was a bring-up diagnostic and is gone.
          */
-        if(frame==3 && start->inject){g_inputPlayer=start->player;g_inputInject=start->inject;g_inputReady.store(true,std::memory_order_release);Emit("TOUCH_DIRECT ready; UI-thread JNI injection, original event timestamps");}
+        if(frame==3 && start->inject){g_inputPlayer=start->player;g_inputInject=start->inject;g_inputReady.store(true,std::memory_order_release);Emit("TOUCH_DIRECT ready; worker-thread JNI injection, move interval 4 ms");}
         if(frame>0 && frame%3600==0 && hitchTotal>0)Emit("FRAME_HITCH_SUM frames=%llu hitches=%llu max_ms=%.1f base_ms=%.2f",
             (unsigned long long)frame,(unsigned long long)hitchTotal,(double)hitchMaxNs/1e6,frameBaseMs);
         g_frameInProgress=false;
@@ -4155,19 +4138,7 @@ extern "C" void ReaFrameHealth(unsigned long long *serial, unsigned int *stuckMs
     *stuckMs = elapsedMs > 0 ? (unsigned int)elapsedMs : 1;
 }
 
-/*
- * Move coalescing. The interceptor delivers one Move per finger, and injecting each of them serially
- * (the injection holds g_touchStateMutex and enters Unity) is what makes many-finger input stall:
- * ten fingers at 120 Hz is ~1200 injections per second, where a real device delivers one
- * MotionEvent per frame carrying every pointer.
- *
- * Only the injection is gated. The position is always recorded first, so the next injected event -
- * whichever finger triggers it - carries every pointer at its current place. Gating the state as well
- * would pin a finger to its last injected position, and because the gate is won by whichever finger
- * arrives first, the losers would trail further and further behind.
- */
-static const int64_t kMoveCoalesceNs = 4000000LL;
-static std::atomic<int64_t> g_lastMoveInject{0};
+static constexpr std::chrono::milliseconds kMoveInterval{4};
 
 /* Same finger ceiling the platform reports; the snapshot arrays are bounded by it. */
 static const int kMaxTouchPoints = 10;
@@ -4227,7 +4198,6 @@ static std::atomic<uint64_t> g_touchJobApplied{0},g_touchJobDropped{0};
 static std::atomic<int64_t> g_touchJobMaxWait{0};
 
 static void *TouchJobBody(void *);
-static void ApplySingleJob(const TouchJob &job);
 static void ApplySnapshotJob(const TouchJob &job);
 
 static void EnsureTouchJobThread()
@@ -4391,31 +4361,6 @@ static void ApplySnapshot(int action,int changedId,double changedX,double change
     }
 }
 
-/* Single pointer event, applied on the injection thread. */
-static void ApplySingleJob(const TouchJob &job)
-{
-    if(!g_inputReady.load(std::memory_order_acquire))return;
-    if(job.action==2){
-        const int64_t now=MonotonicNs();
-        const int64_t last=g_lastMoveInject.load(std::memory_order_relaxed);
-        if(g_optCoalesce.load(std::memory_order_relaxed) && last>0 && now-last<kMoveCoalesceNs){
-            RecordTouchState({job.action,job.id,job.x,job.y,job.source,job.entry});
-            return;
-        }
-        /*
-         * The window may only move when an event was actually injected. It used to be stamped before
-         * the call, so a move that the jitter filter swallowed still opened a new window and suppressed
-         * the next real move as well - two fingers sliding together each cost the other 4 ms.
-         */
-        bool injected=false;
-        SubmitTouch({job.action,job.id,job.x,job.y,job.source,job.entry},false,&injected);
-        if(injected)g_lastMoveInject.store(now,std::memory_order_relaxed);
-        return;
-    }
-    g_lastMoveInject.store(0,std::memory_order_relaxed);
-    SubmitTouch({job.action,job.id,job.x,job.y,job.source,job.entry});
-}
-
 static void ApplySnapshotJob(const TouchJob &job)
 {
     ApplySnapshot(job.action,job.changedId,job.changedX,job.changedY,
@@ -4427,6 +4372,8 @@ static void *TouchJobBody(void *)
     pthread_setname_np(pthread_self(),"ReaTouchInject");
     int64_t lastLogNs=0;
     int queueLogs=0;
+    using Clock = std::chrono::steady_clock;
+    auto nextMoveAt = Clock::time_point::min();
     for(;;){
         TouchJob job;
         {
@@ -4447,33 +4394,39 @@ static void *TouchJobBody(void *)
             int64_t seen=g_touchJobMaxWait.load(std::memory_order_relaxed);
             while(wait>seen && !g_touchJobMaxWait.compare_exchange_weak(seen,wait,std::memory_order_relaxed)){}
         }
-        /*
-         * Fold the moves that are already queued behind this one into a single injection. Only moves are
-         * folded and only ones already in the queue are taken, so a press or a lift keeps its position
-         * in the order and no move waits for anything.
-         */
-        if(job.kind==0 && job.action==2 && g_optCoalesce.load(std::memory_order_relaxed)){
-            std::map<int,TouchPoint> latest;
-            TouchInput changed{2,job.id,job.x,job.y,job.source,job.entry};
+        if (job.kind == 0 && job.action == 2 && g_optCoalesce.load(std::memory_order_relaxed)) {
+            TouchInput moves[kMaxTouchPoints]{{2, job.id, job.x, job.y, job.source, job.entry}};
+            size_t count = 1;
             {
                 std::unique_lock<std::mutex> lock(g_touchJobMutex);
-                int take=0;
-                while(!g_touchJobs.empty() && take<kMaxTouchPoints){
-                    const TouchJob &next=g_touchJobs.front();
-                    if(next.kind!=0 || next.action!=2)break;
-                    latest[next.id]=TouchPoint{next.id,next.x,next.y};
-                    if(next.source>changed.sourceNs)changed.sourceNs=next.source;
-                    changed.entryNs=next.entry;
+                for (;;) {
+                    // The fixed deadline also groups samples that arrive while the queue is empty.
+                    // An edge or snapshot at the head flushes moves before it is processed.
+                    if (g_touchJobs.empty() &&
+                        (Clock::now() >= nextMoveAt || !g_touchJobSignal.wait_until(lock, nextMoveAt, [] {
+                            return !g_touchJobs.empty() || !g_touchJobRun.load();
+                        }))) break;
+                    if (g_touchJobs.empty()) break;
+                    const TouchJob &next = g_touchJobs.front();
+                    if (next.kind != 0 || next.action != 2) break;
+                    size_t slot = 0;
+                    while (slot < count && moves[slot].id != next.id) ++slot;
+                    if (slot == kMaxTouchPoints) break;
+                    if (slot == count) ++count;
+                    moves[slot] = {2, next.id, next.x, next.y, next.source, next.entry};
                     g_touchJobs.pop_front();
-                    ++take;
                 }
             }
-            bool injected=false;
-            ApplyMoveBatch(latest,changed,&injected);
-            if(injected)g_lastMoveInject.store(MonotonicNs(),std::memory_order_relaxed);
+            const auto injectAt = Clock::now();
+            if (ApplyMoveBatch(moves, count)) nextMoveAt = injectAt + kMoveInterval;
             g_touchJobApplied.fetch_add(1,std::memory_order_relaxed);
         } else {
-            if(job.kind==0)ApplySingleJob(job); else ApplySnapshotJob(job);
+            nextMoveAt = Clock::time_point::min();
+            if (job.kind == 0) {
+                SubmitTouch({job.action, job.id, job.x, job.y, job.source, job.entry});
+            } else {
+                ApplySnapshotJob(job);
+            }
             g_touchJobApplied.fetch_add(1,std::memory_order_relaxed);
         }
 
